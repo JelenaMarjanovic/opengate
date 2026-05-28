@@ -1,0 +1,32 @@
+# Compiled binaries and shared libraries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Profiling and test output
+*.out
+
+# Coverage reports
+coverage.html
+coverage.txt
+
+# Build artifacts
+/bin/
+/dist/
+
+# IDE / editor local files
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Claude-related
+.claude
