@@ -1,0 +1,93 @@
+# golangci-lint v2 configuration for OpenGate.
+# See: https://golangci-lint.run/usage/configuration/
+#
+# Strategy: disable defaults, enable an explicit set, document any rule
+# overrides inline so future contributors understand why each lives here.
+
+version: "2"
+
+run:
+  timeout: 5m
+  # Target Go version used by go/analysis; align with go.mod.
+  go: "1.26"
+
+linters:
+  # Disable the defaults; we curate the enabled set explicitly.
+  default: none
+  enable:
+    - errcheck      # Every returned error must be checked or assigned to _.
+    - govet         # Standard Go vet analyzers (printf, lock copies, etc).
+    - staticcheck   # In v2, absorbs gosimple, ineffassign, and unused.
+    - revive        # Lightweight golint successor; per-rule configurable.
+    - gosec         # Security scanner: weak hashes, weak RNG, SQL injection.
+    - gocritic      # Opinionated style and performance hints.
+    - misspell      # Catches typos in comments and string literals.
+    - godot         # Trailing period on Godoc comments.
+    - gocyclo       # Cyclomatic complexity ceiling.
+
+  settings:
+    gocyclo:
+      # Starting threshold; raise per-function with nolint if justified.
+      min-complexity: 15
+
+    revive:
+      # Severity for all rules unless overridden per-rule.
+      severity: warning
+      # Enable revive's default rule set; it includes package-comments,
+      # exported, var-naming, and other standard checks.
+      enable-all-rules: false
+      rules:
+        - name: package-comments
+        - name: exported
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: error-return
+        - name: error-naming
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: range-val-in-closure
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+          disabled: true  # Too noisy on interface implementations.
+
+    gosec:
+      # G104 (errors unhandled) duplicates errcheck; disable to avoid noise.
+      excludes:
+        - G104
+      # Severity threshold for reporting findings.
+      severity: low
+      confidence: low
+
+    misspell:
+      locale: US
+
+    godot:
+      # Check only top-level (package and exported) comments.
+      scope: declarations
+      capital: false
+
+  exclusions:
+    # Exclude generated files and vendor directories from all linters.
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  # Report every issue, do not collapse duplicates in early development.
+  max-issues-per-linter: 0
+  max-same-issues: 0

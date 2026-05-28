@@ -1,0 +1,31 @@
+# Lefthook configuration for OpenGate.
+# See: https://lefthook.dev/configuration/
+#
+# Pre-commit semantics:
+# - Hooks run on `git commit`. Bypass with `git commit --no-verify`.
+# - {staged_files} expands to the list of files about to be committed.
+# - Commands run in parallel; any non-zero exit blocks the commit.
+
+min_version: 1.13.0
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.go"
+      # gofmt -l prints names of unformatted files and exits 0 regardless.
+      # We wrap it so non-empty output becomes a non-zero exit, which
+      # lefthook treats as a hook failure.
+      run: |
+        out=$(gofmt -l {staged_files})
+        if [ -n "$out" ]; then
+          echo "Unformatted files (run 'make fmt' to fix):"
+          echo "$out"
+          exit 1
+        fi
+
+    vet:
+      glob: "*.go"
+      # vet works on packages, not files. Run over the whole module;
+      # for OpenGate at this size, this completes in well under a second.
+      run: go vet ./...
