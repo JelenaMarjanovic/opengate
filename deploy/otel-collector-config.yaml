@@ -1,0 +1,51 @@
+# OpenTelemetry Collector (contrib) configuration.
+# Receives OTLP from applications, forwards traces to Tempo and exposes
+# metrics in Prometheus format for Prometheus to scrape.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # memory_limiter guards against unbounded memory growth under load.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+  # batch groups telemetry to reduce export overhead.
+  batch:
+    timeout: 5s
+
+exporters:
+  # Forward traces to Tempo over OTLP gRPC. insecure=true because this is
+  # an internal Docker-network hop, not exposed externally.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Expose collected metrics in Prometheus exposition format; Prometheus
+  # scrapes this endpoint (see prometheus.yml scrape_configs).
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+extensions:
+  # health_check exposes :13133/ for liveness; present for completeness
+  # even though the distroless image can't run a CMD healthcheck against it.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

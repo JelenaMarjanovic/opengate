@@ -1,0 +1,21 @@
+# OpenGate edge reverse proxy.
+#
+# Local development uses Caddy's internal CA for self-signed TLS. To
+# silence browser certificate warnings, run on the host:
+#   docker compose exec caddy caddy trust
+# (or accept the warning for local development).
+#
+# The /api/ route is intentionally absent; it is added when the API
+# service is introduced in a later epic.
+
+localhost {
+	tls internal
+
+	handle_path /grafana/* {
+		reverse_proxy grafana:3000
+	}
+
+	handle {
+		respond "OpenGate edge proxy — API service not yet wired (US-01.03 scaffold)" 200
+	}
+}

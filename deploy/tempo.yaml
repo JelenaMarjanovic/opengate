@@ -1,0 +1,21 @@
+# Grafana Tempo monolithic (single-binary) configuration for local dev.
+# Stores trace blocks on local disk; suitable for development and demo,
+# not for production scale.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

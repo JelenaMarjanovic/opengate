@@ -1,0 +1,154 @@
+# OpenGate local development and demo stack.
+#
+# Bring up:   docker compose up -d
+# Tear down:  docker compose down            (keeps named volumes)
+# Wipe data:  docker compose down -v          (removes named volumes)
+#
+# Requires a .env file at the repo root; copy .env.example and fill it in.
+#
+# Health-check note: postgres, prometheus, and grafana expose CMD health
+# checks. The otel-collector image is distroless (no shell), and tempo/caddy
+# shell availability is not relied upon, so those services use depends_on
+# start ordering rather than service_healthy conditions. Proper health
+# probes for those would require sidecars or shell-bearing images; deferred
+# as a dev-stack limitation.
+
+name: opengate
+
+services:
+  postgres:
+    image: postgres:16.14-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opengate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-opengate}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U ${POSTGRES_USER:-opengate} -d ${POSTGRES_DB:-opengate}'
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    # Postgres is internal-only. To debug from the host, uncomment:
+    # ports:
+    #   - "5432:5432"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.145.0
+    command: ['--config=/etc/otel-collector-config.yaml']
+    volumes:
+      - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - '4317:4317' # OTLP gRPC — applications send telemetry here.
+      - '4318:4318' # OTLP HTTP — alternate ingestion path.
+    networks:
+      - internal
+    depends_on:
+      tempo:
+        condition: service_started
+
+  tempo:
+    image: grafana/tempo:2.10.5
+    command: ['-config.file=/etc/tempo.yaml']
+    volumes:
+      - ./deploy/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    networks:
+      - internal
+
+  prometheus:
+    image: prom/prometheus:v3.11.2
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - internal
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--quiet',
+          '--spider',
+          'http://localhost:9090/-/healthy'
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:13.0.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SERVER_ROOT_URL: https://localhost:8443/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: 'true'
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - edge
+      - internal
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--quiet',
+          '--spider',
+          'http://localhost:3000/api/health'
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  caddy:
+    image: caddy:2.11.3-alpine
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    # Host ports remapped from 80/443 to 8080/8443 because the host's
+    # Apache occupies :80 in this development environment. Access Grafana
+    # at https://localhost:8443/grafana/ instead of https://localhost/.
+    ports:
+      - '8080:80'
+      - '8443:443'
+    networks:
+      - edge
+    depends_on:
+      grafana:
+        condition: service_started
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  tempo_data:
+  prometheus_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:
