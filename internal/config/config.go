@@ -13,6 +13,12 @@ type Config struct {
 	// slog.Level implements encoding.TextUnmarshaler, so envconfig parses
 	// "DEBUG"/"INFO"/"WARN"/"ERROR". Invalid values fail Load (fail-fast).
 	LogLevel slog.Level `envconfig:"LOG_LEVEL" default:"INFO"`
+
+	// BypassRLSURL is the DSN for the BYPASSRLS operator pool (System Design
+	// §10), used by the bootstrap subcommand. It is intentionally NOT required:
+	// most subcommands (e.g. migrate) do not need it, so making it mandatory
+	// would break them. The bootstrap subcommand validates its presence itself.
+	BypassRLSURL string `envconfig:"BYPASS_RLS_DATABASE_URL"`
 }
 
 // Load reads configuration from the environment. A parse failure returns an

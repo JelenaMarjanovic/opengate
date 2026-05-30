@@ -6,6 +6,7 @@
 // importing this package.
 //
 // The Config struct is the single source of truth (System Design §23). It
-// carries only LogLevel today; add fields here only when the code consuming
-// them lands, so the binary never requires unused config.
+// carries LogLevel and the optional bypass-pool DSN today; add fields here only
+// when the code consuming them lands, so the binary never requires unused
+// config.
 package config

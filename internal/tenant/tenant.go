@@ -1,14 +1,19 @@
 package tenant
 
-import "context"
+import (
+	"context"
 
-// ID is the tenant identifier carried in the request context. Distinct type so
-// it cannot be confused with any other string. Representation is string for now;
-// US-02.01 may promote it to UUID-backed once the DB column type is concrete.
-type ID string
+	"github.com/google/uuid"
+)
 
-// String returns the tenant ID as a plain string.
-func (id ID) String() string { return string(id) }
+// ID is the tenant identifier carried in the request context. It is a distinct
+// type so it cannot be confused with any other UUID or string flowing through
+// the context. US-02.01 promoted it from a plain string to UUID-backed now that
+// the DB column type is concrete (uuid, DB §5.1).
+type ID uuid.UUID
+
+// String returns the canonical RFC 4122 string form of the tenant ID.
+func (id ID) String() string { return uuid.UUID(id).String() }
 
 type ctxKey struct{}
 
