@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"time"
 
@@ -18,8 +19,9 @@ import (
 
 // runMigrate implements the `opengate migrate <action>` subcommand.
 // Supported actions mirror a subset of goose's surface: up, down, status,
-// version. The DSN is read from OPENGATE_DATABASE_URL.
-func runMigrate(args []string) error {
+// version. The DSN is read from OPENGATE_DATABASE_URL. The logger is injected
+// from the composition root so failures surface as structured records.
+func runMigrate(ctx context.Context, logger *slog.Logger, args []string) error {
 	flags := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: opengate migrate <up|down|status|version>")
@@ -57,13 +59,13 @@ func runMigrate(args []string) error {
 	}
 	defer func() {
 		if cerr := db.Close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "migrate: close database: %v\n", cerr)
+			logger.ErrorContext(ctx, "migrate: close database", slog.Any("error", cerr))
 		}
 	}()
 
 	// Verify connectivity early with a short timeout so a bad DSN fails
 	// fast with a clear error rather than hanging on the first query.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("migrate: ping database: %w", err)
