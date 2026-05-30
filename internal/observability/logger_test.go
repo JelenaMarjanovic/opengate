@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/JelenaMarjanovic/opengate/internal/observability"
@@ -61,15 +62,16 @@ func TestContextEnrichment(t *testing.T) {
 		TraceFlags: trace.FlagsSampled,
 	})
 	ctx := trace.ContextWithSpanContext(context.Background(), sc)
-	ctx = tenant.NewContext(ctx, "acme")
+	tenantID := uuid.New()
+	ctx = tenant.NewContext(ctx, tenant.ID(tenantID))
 
 	var buf bytes.Buffer
 	logger := observability.NewLogger(&buf, slog.LevelInfo)
 	logger.InfoContext(ctx, "x")
 
 	rec := decodeLine(t, buf.Bytes())
-	if got := rec["tenant_id"]; got != "acme" {
-		t.Errorf("tenant_id = %v, want acme", got)
+	if got := rec["tenant_id"]; got != tenantID.String() {
+		t.Errorf("tenant_id = %v, want %v", got, tenantID.String())
 	}
 	if got := rec["trace_id"]; got != tid.String() {
 		t.Errorf("trace_id = %v, want %v", got, tid.String())
