@@ -75,7 +75,7 @@ lint: $(GOLANGCI_LINT) ## Run golangci-lint over the entire module
 
 .PHONY: test
 test: ## Run all tests
-	@go test ./...
+	@go test -coverprofile=coverage.out -covermode=atomic ./...
 
 .PHONY: build
 build: ## Build the opengate binary into ./bin/opengate
