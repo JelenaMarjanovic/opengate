@@ -1,6 +1,6 @@
 # OpenGate — Implementation Plan
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Draft for review
 **Document type:** Implementation plan (epics, user stories, sprint plan, risk register)
 **Author:** Jelena Marjanović
@@ -240,6 +240,8 @@ _Dependencies:_ US-01.01
 
 _Technical Notes:_ The goose integration pattern is specified in Database Schema section three. The embedded filesystem uses Go's standard `embed` package.
 
+Reality (v1.1): US-01.04 as executed delivered the goose mechanism and `go:embed` only. The first content migration was the `tenants` DDL (Database Schema §5.1), not the role-creation migration named in the description and AC-1/AC-2; the `opengate_app`/`opengate_bypass` role migration (`create_app_roles`) landed in US-02.01. The full Sprint-1 migration sequence, tooling, and pin record is authoritative in the Sprint 1 retrospective.
+
 _INVEST:_ All criteria satisfied.
 
 ---
@@ -345,7 +347,7 @@ _Story Points:_ 2
 
 _Dependencies:_ US-01.01
 
-_Technical Notes:_ The Argon2id parameters are specified in System Design section nine. The implementation uses `golang.org/x/crypto/argon2`.
+_Technical Notes:_ The Argon2id parameters are specified in System Design section nine. The implementation uses `golang.org/x/crypto/argon2`. Realized scope (v1.1): `HashPassword` was delivered in US-02.01 (decision D1), so US-02.02 as executed reduced to specifying and verifying `VerifyPassword`, the PHC round-trip, and the malformed-hash guards. The 2-point estimate reflects the original combined scope.
 
 _INVEST:_ All criteria satisfied.
 
@@ -369,6 +371,8 @@ _Story Points:_ 5
 _Dependencies:_ US-02.01, US-02.02
 
 _Technical Notes:_ Session token generation, hashing, and cookie attributes are specified in System Design section nine. The session middleware is part of the chi middleware stack.
+
+Scope (v1.1): US-02.03 delivers the `sessions` table, the login/logout/refresh use case, and the session middleware only; the connection pool and RLS policies are US-02.05. The two pre-authentication identity lookups — user-by-email at login, and session-by-token on every request — execute on the BYPASSRLS pool, because they must resolve identity across a not-yet-known tenant boundary and because US-02.05 forces RLS on `users` and `sessions` (a context-less query against an RLS-forced table returns zero rows, so a naive lookup would pass in this sprint and then break when US-02.05 lands). Open decision, deferred to this story's articulation: how login resolves the tenant, given that `users.email` is unique per tenant (`UNIQUE (tenant_id, email)`) and the `/api/v1/auth/login` endpoint carries no tenant in its path. Candidate mechanisms: tenant identifier in the request body, host/subdomain resolution, single-tenant-per-deployment, or globally-unique email. The chosen mechanism is recorded in System Design section nine.
 
 _INVEST:_ All criteria satisfied.
 
@@ -396,47 +400,33 @@ _INVEST:_ All criteria satisfied.
 
 ---
 
-**US-02.05: Implement Postgres connection pool with tenant binding hook**
+**US-02.05: Implement connection pool with tenant binding, RLS policies, and dual-layer verification**
 
-_Format:_ As the implementer, I want the Postgres connection pool to set the `app.current_tenant_id` session variable on every connection checkout based on the request context, so that the Row-Level Security policies enforce tenant isolation at the database layer.
+_Format:_ As the implementer, I want the regular Postgres pool to bind `app.current_tenant_id` from the request context on every checkout, and Row-Level Security enabled and forced on every tenant-scoped table existing so far, so that tenant isolation is enforced by two independent layers from the moment identity data is first written.
 
-_Description:_ Create `internal/adapters/outbound/postgres/pool.go` with the pgx pool configuration including the AfterAcquire and BeforeRelease hooks per System Design section ten. Add the BYPASSRLS pool variant for the bootstrap CLI and the export job. Verify the dual-layer isolation by adding the test described in System Design section ten.
+_Description:_ Create `internal/adapters/outbound/postgres/pool.go` with the pgx pool `AfterAcquire`/`BeforeRelease` hooks per System Design section ten; the `AfterAcquire` hook logs a warning when no tenant is in context. Add the BYPASSRLS pool variant for operator paths (bootstrap, export) and the pre-authentication identity lookups (see US-02.03). In the same story, add the migration that enables and forces RLS and creates the `tenant_isolation` policies on `tenants`, `users`, and `sessions` per Database Schema section thirteen, and add the dual-layer verification test. The pool code lands before the RLS migration, per the migrations-follow-code discipline. This story absorbs former US-02.06.
 
 _Acceptance Criteria:_
 
-1. Given a request with tenant A in context, When a query against `members_view` is issued, Then only members belonging to tenant A are returned.
-2. Given a request with no tenant in context, When a query against any tenant-scoped table is issued, Then the query returns zero rows and the application logs a warning identifying the missing tenant context.
-3. Given the BYPASSRLS connection pool, When the same query is issued, Then rows from all tenants are returned, confirming that the bypass mechanism works for operator-level paths.
+1.  Given two tenants each with one user seeded via the BYPASSRLS pool, When a connection bound to tenant A queries `users`, Then only tenant A's user is returned.
+2.  Given a connection with no tenant in context, When `tenants`, `users`, or `sessions` is queried, Then zero rows are returned and the application logs a warning identifying the missing tenant context.
+3.  Given a raw query that omits the `WHERE tenant_id` predicate on a connection bound to tenant A, When it is executed against `users`, Then only tenant A's rows are returned, confirming the RLS layer is independent of the application-layer filter.
+4.  Given the BYPASSRLS pool, When the same query is issued, Then rows from both tenants are returned, confirming the protection comes from RLS specifically and not from another accident.
+5.  Given the migration is rolled back, When `pg_policies` is queried, Then no `tenant_isolation` policies remain on `tenants`, `users`, or `sessions`.
 
-_Story Points:_ 3
+_Story Points:_ 5
 
-_Dependencies:_ US-02.01, US-01.04
+_Dependencies:_ US-02.01, US-02.03, US-01.04
 
-_Technical Notes:_ The pool configuration is specified in System Design section ten. The verification test is the contract test pattern from System Design section seven.
+_Technical Notes:_ The pool configuration and the dual-layer verification test are specified in System Design section ten; the policy definitions are in Database Schema section thirteen. The dependency on US-02.03 is new in v1.1: this story enables RLS on the `sessions` table, which US-02.03 creates, so US-02.03 must complete first. Both stories sit in Sprint 3, so the dependency is satisfied within the sprint.
 
-_INVEST:_ All criteria satisfied.
+_INVEST:_ All criteria satisfied. The story is larger (5 points) than the INVEST "Small" ideal but is not further divisible without producing two halves neither of which can satisfy an isolation acceptance criterion on its own.
 
 ---
 
-**US-02.06: Enable RLS on initial tables and verify isolation**
+**US-02.06: Enable RLS on initial tables and verify isolation** — _Absorbed into US-02.05 (v1.1)._
 
-_Format:_ As the implementer, I want Row-Level Security enabled and the tenant_isolation policy created on every tenant-scoped table introduced so far, so that the second isolation layer is in effect from the moment data is first written.
-
-_Description:_ Create the migration that enables RLS and creates the `tenant_isolation` policies per Database Schema section thirteen for the tables created so far (`tenants`, `users`, `sessions`). The policies for the remaining tables are created in their respective epics. Verify the policy with the test from US-02.05/AC-1 and AC-2.
-
-_Acceptance Criteria:_
-
-1. Given the migration is applied, When the table is queried with `pg_policies`, Then the `tenant_isolation` policy is listed on each of `tenants`, `users`, and `sessions`.
-2. Given a connection bound to tenant A, When `SELECT * FROM users WHERE tenant_id = '<tenant_b_uuid>'` is executed, Then zero rows are returned regardless of the explicit filter.
-3. Given the migration is rolled back, When the policies are queried, Then no `tenant_isolation` policies remain on the affected tables.
-
-_Story Points:_ 2
-
-_Dependencies:_ US-02.05
-
-_Technical Notes:_ The RLS policy definitions are in Database Schema section thirteen.
-
-_INVEST:_ All criteria satisfied.
+The connection-level tenant binding (formerly US-02.05) and the RLS policies it drives (formerly this story) are one jointly-verifiable capability and are now a single story; see US-02.05, whose acceptance criteria subsume the policy-presence, isolation, and rollback checks formerly listed here. The 2-point estimate is folded into US-02.05's 5. Retained as a stub for traceability.
 
 **Epic E2 total: 20 story points.**
 
@@ -1622,8 +1612,8 @@ The table below summarizes the sprint plan. Each row shows the sprint number, th
 | ------ | ---- | ------------------ | ---------------------------------------------------------- | ------ |
 | S1     | 1    | E1                 | US-01.01, US-01.02, US-01.03, US-01.04                     | 12     |
 | S2     | 2    | E1, E2             | US-01.05, US-01.06, US-02.01, US-02.02                     | 10     |
-| S3     | 3    | E2, E3             | US-02.03, US-02.04, US-02.05                               | 13     |
-| S4     | 4    | E2, E3             | US-02.06, US-03.01, US-03.02, US-03.03                     | 11     |
+| S3     | 3    | E2, E3             | US-02.03, US-02.04, US-02.05                               | 15     |
+| S4     | 4    | E2, E3             | US-03.01, US-03.02, US-03.03                               | 9      |
 | S5     | 5    | E3, E4             | US-03.04, US-03.05, US-03.06                               | 15     |
 | S6     | 6    | E4, E5             | US-04.01, US-04.02, US-04.03, US-04.04                     | 16     |
 | S7     | 7    | E5, E6             | US-05.01, US-05.02, US-05.03, US-05.04                     | 13     |
@@ -1631,9 +1621,9 @@ The table below summarizes the sprint plan. Each row shows the sprint number, th
 | S9     | 9    | E7, E8             | US-07.01, US-07.02, US-07.03, US-08.01                     | 16     |
 | S10    | 10   | E9, E10            | US-09.01, US-09.02, US-09.03, US-10.01                     | 16     |
 | S11    | 11   | E10, E11, E12, E13 | US-10.02, US-10.03, US-11.01, US-11.02, US-12.01, US-13.01 | 22     |
-| S12    | 12   | E12, E13, E14      | US-12.02, US-13.02 — US-13.07, US-14.01 — US-14.04         | 39     |
+| S12    | 12   | E12, E13, E14      | US-12.02, US-13.02 — US-13.07, US-14.01 — US-14.04         | 44     |
 
-The total points in the plan is 196, which exceeds the sprint capacity of 108 across twelve sprints. This is because the table double-counts stories whose work falls primarily into the visible UI epic (E13) — the dashboard pages require substantial work but each individual page-story is small, and they are batched into the final sprints once the API surface is complete. The realistic completion likelihood is that several E13 stories slip beyond the sixty-day window and become known scope reduction items; this is documented in the risk register in section twenty-three.
+The total points in the plan is 201, verified two ways that agree: the sum of the 55 per-story estimates is 201, and the sum of the 14 epic totals is 201. This exceeds the sprint capacity of 108 (twelve sprints at nine points) — a genuine over-allocation of 93 points, not an artifact of double-counting, since each story appears exactly once. The over-allocation is absorbed by the planned E13 dashboard scope reduction (risk R-02): the dashboard pages carry substantial total work concentrated in the final sprints, and several E13 page-stories are expected to slip beyond the sixty-day window and become known scope-reduction items, as documented in the risk register in section twenty-three.
 
 The dependency chain is verified by inspecting the dependencies field of each story and confirming that every story's dependencies are completed in or before its assigned sprint. The verification was performed manually during plan construction and is documented as a deferred task to be re-verified after each sprint review.
 
@@ -1681,15 +1671,14 @@ The matrix below shows the inter-story dependencies in tabular form. Each row li
 | US-02.02 | US-01.01                     |
 | US-02.03 | US-02.01, US-02.02           |
 | US-02.04 | US-02.03                     |
-| US-02.05 | US-02.01, US-01.04           |
-| US-02.06 | US-02.05                     |
-| US-03.01 | US-02.06                     |
+| US-02.05 | US-02.01, US-02.03, US-01.04 |
+| US-03.01 | US-02.05                     |
 | US-03.02 | US-01.01                     |
 | US-03.03 | US-03.01, US-03.02           |
 | US-03.04 | US-03.01, US-01.06           |
 | US-03.05 | US-03.04, US-02.05           |
 | US-03.06 | US-03.05                     |
-| US-04.01 | US-03.03, US-02.06           |
+| US-04.01 | US-03.03, US-02.05           |
 | US-04.02 | US-04.01                     |
 | US-04.03 | US-04.01                     |
 | US-04.04 | US-04.03                     |
@@ -1751,7 +1740,7 @@ The exact strategy for handling production deployment beyond the Docker Compose 
 
 This document is version one point zero of the Implementation Plan for OpenGate. The document and all five preceding planning documents (PRD, PFD, System Architecture, System Design, Database Schema) now collectively constitute the complete planning corpus for the project. The next artifact in the project lifecycle is the codebase itself, the production of which is the work that the present document plans.
 
-The total story points across all fourteen epics is one hundred ninety-six. The total sprint capacity is one hundred eight. The plan therefore explicitly carries a known overallocation, justified by the principle that E13 dashboard work can be scope-reduced or deferred to v1.1 if velocity does not support its full completion. The author proceeds to sprint one with this understanding.
+The total story points across all fourteen epics is two hundred one. The total sprint capacity is one hundred eight. The plan therefore explicitly carries a known overallocation, justified by the principle that E13 dashboard work can be scope-reduced or deferred to v1.1 if velocity does not support its full completion. The author proceeds to sprint one with this understanding.
 
 The first sprint, S1, begins on the day after this document is accepted. Sprint planning for S1 consists of pulling the four stories US-01.01, US-01.02, US-01.03, US-01.04 with a total of twelve story points, conducting the final INVEST check on each pulled story, and confirming that all dependencies are satisfied (US-01.01 has no dependencies, the other three depend only on US-01.01 which will be completed first within the sprint). The sprint goal is "Project bootstrapped and ready for domain implementation." The sprint review at the end of S1 demonstrates the project building, the Docker Compose stack running, and the first migration applied.
 

@@ -1,6 +1,6 @@
 # OpenGate — Product Requirements Document
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Draft for review
 **Document type:** Portfolio sample specification (hybrid PRD / Technical Specification Document)
 **Author:** Jelena Marjanović
@@ -122,7 +122,7 @@ The detailed task-level decomposition of each milestone is the subject of the Im
 
 The technology choices for OpenGate are made deliberately to balance senior-engineer credibility, learning surface during the project window, and production realism. The choices and their justifications follow.
 
-For the backend language and runtime, Go version 1.23 or higher is used. Go is the explicit target language of the portfolio signal and is the foundation of the entire project. The version pinning reflects the most recent stable Go release as of the project start and ensures access to recent standard library improvements.
+For the backend language and runtime, Go 1.26 is used, pinned via the `go` directive in `go.mod`, which is the single source of truth and is consumed by CI through `setup-go`'s `go-version-file`. Go is the explicit target language of the portfolio signal and is the foundation of the entire project. The realized 1.26 satisfies the original target — most recent stable release as of project start, no lower than 1.23 — and ensures access to recent standard library improvements.
 
 For the relational database, PostgreSQL version 16 is used. The choice of Postgres is foundational to several of the architectural decisions described in section four, including the event store, the Row-Level Security multi-tenant isolation, and the use of advisory locks for coordination. Version 16 is chosen for stability, broad ecosystem support, and access to recent features such as logical replication improvements.
 

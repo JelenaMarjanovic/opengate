@@ -1,6 +1,6 @@
 # OpenGate — Database Schema Document
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Draft for review
 **Document type:** Concrete schema specification (tables, columns, constraints, indexes, RLS policies, migration structure)
 **Author:** Jelena Marjanović
@@ -1110,6 +1110,13 @@ DO $$ BEGIN
 END $$;
 
 GRANT USAGE ON SCHEMA public TO opengate_app, opengate_bypass;
+GRANT CONNECT ON DATABASE opengate TO opengate_app, opengate_bypass;
+-- Table-level grants accrete as tables land (realized in v1.1):
+--   create_app_roles additionally grants SELECT, INSERT on tenants to
+--   opengate_bypass;
+--   create_users additionally grants SELECT, INSERT on users to
+--   opengate_bypass.
+-- Per-table grants for opengate_app are issued with each table's own migration.
 -- +goose StatementEnd
 
 -- +goose Down
@@ -1122,6 +1129,8 @@ DROP ROLE IF EXISTS opengate_bypass;
 The `DO $$ ... $$` block is a PostgreSQL anonymous code block that allows conditional logic in DDL. The block checks whether the role already exists before creating it; this idempotency is important because the migration may be run against a database where the roles were created out-of-band.
 
 The placeholder passwords in the role creation are replaced by the operator before deployment using `ALTER ROLE ... WITH PASSWORD ...` statements run as a Postgres superuser. The migration does not contain real passwords because migrations are committed to the repository and real passwords would be exposed.
+
+Note (v1.1): the realized role-creation migration issues the table-level grants shown in the comments above and an explicit `CONNECT` grant. The explicit `CONNECT` is added because a hardened production database commonly revokes the default `PUBLIC` `CONNECT`; relying on that default is unsafe. Table ownership is a known item: `tenants` is owned by the migration-runner role rather than `opengate_app`, because the `tenants` migration predates the role migration in realized history (see Implementation Plan US-01.04 realized-scope note). Under `FORCE ROW LEVEL SECURITY` the owner does not bypass the policy, so ownership does not affect isolation, but it should be normalized with `ALTER TABLE ... OWNER TO opengate_app` in a later migration for grant-management hygiene.
 
 ---
 
