@@ -23,10 +23,11 @@ func NewBootstrapper(writer ports.IdentityWriter) *Bootstrapper {
 }
 
 // Run hashes the owner password, mints UUIDv7 IDs for the tenant and owner,
-// builds the domain aggregates, and persists them atomically via the writer.
-// The writer's ErrTenantExists propagates unchanged so the caller can map it to
-// an operator-facing message.
-func (b *Bootstrapper) Run(ctx context.Context, tenantName, ownerEmail, ownerPassword string) error {
+// builds the domain aggregates, and persists them atomically via the writer. The
+// tenantSlug is resolved by the caller (explicit or derived from the name) and
+// re-validated here by NewTenant. The writer's ErrTenantExists propagates
+// unchanged so the caller can map it to an operator-facing message.
+func (b *Bootstrapper) Run(ctx context.Context, tenantName, tenantSlug, ownerEmail, ownerPassword string) error {
 	hash, err := auth.HashPassword(ownerPassword)
 	if err != nil {
 		return fmt.Errorf("hash owner password: %w", err)
@@ -42,7 +43,7 @@ func (b *Bootstrapper) Run(ctx context.Context, tenantName, ownerEmail, ownerPas
 		return fmt.Errorf("generate owner id: %w", err)
 	}
 
-	tenant, err := domain.NewTenant(tenantID, tenantName)
+	tenant, err := domain.NewTenant(tenantID, tenantName, tenantSlug)
 	if err != nil {
 		return fmt.Errorf("build tenant: %w", err)
 	}
