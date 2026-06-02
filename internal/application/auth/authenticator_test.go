@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -309,6 +310,14 @@ func TestLoginSuccess(t *testing.T) {
 	if got.TenantID != tenantID || got.UserID != userID {
 		t.Errorf("tenant/user = %v/%v, want %v/%v", got.TenantID, got.UserID, tenantID, userID)
 	}
+
+	// The success path is intentionally silent (rehash and last-login log only on
+	// failure; minting logs nothing), so there is no log to assert against here.
+	// Secret-absence is covered on the post-mint failure path by
+	// TestLoginDoesNotLogSessionSecret.
+	if h.logbuf.Len() != 0 {
+		t.Errorf("success path emitted unexpected logs:\n%s", h.logbuf.String())
+	}
 }
 
 // --- Login: enumeration defense (the central test) ---------------------------
@@ -479,6 +488,38 @@ func TestLoginSessionCreateFailure(t *testing.T) {
 	}
 	if errors.Is(err, appauth.ErrInvalidCredentials) {
 		t.Error("a creation fault must not surface as ErrInvalidCredentials")
+	}
+}
+
+// TestLoginDoesNotLogSessionSecret proves the session token and its token_hash
+// never reach the logs on the post-mint path. The Create-failure path is the
+// most dangerous one — it has the freshly-minted NewSession (carrying TokenHash)
+// in scope while it builds the error — so we drive Login into it and assert that
+// none of the secret's plausible encodings appears in the captured buffer: the
+// raw-url cookie value, and the SHA-256 hash in hex and in both std-base64
+// variants (a stray "%+v" of the struct or of the byte slice would surface one
+// of these).
+func TestLoginDoesNotLogSessionSecret(t *testing.T) {
+	h := newHarness()
+	h.sessions.createErr = errors.New("db is down") // reach minting, then fail at Create.
+
+	if _, err := h.auth.Login(context.Background(), defaultParams()); err == nil {
+		t.Fatal("expected an error when Create fails")
+	}
+
+	sum := sha256.Sum256(rawToken)
+	secrets := map[string]string{
+		"cookie token (raw-url base64)": base64.RawURLEncoding.EncodeToString(rawToken),
+		"token_hash (hex)":              hex.EncodeToString(sum[:]),
+		"token_hash (std base64)":       base64.StdEncoding.EncodeToString(sum[:]),
+		"token_hash (raw-std base64)":   base64.RawStdEncoding.EncodeToString(sum[:]),
+	}
+
+	logged := h.logbuf.String()
+	for name, secret := range secrets {
+		if strings.Contains(logged, secret) {
+			t.Errorf("session secret leaked into logs: %s = %q\nlog buffer:\n%s", name, secret, logged)
+		}
 	}
 }
 
