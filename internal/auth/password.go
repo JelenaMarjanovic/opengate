@@ -43,6 +43,26 @@ func HashPassword(plaintext string) (string, error) {
 // wrong password (401) separately from corrupt stored data (500).
 var ErrPasswordMismatch = errors.New("password does not match")
 
+// dummyHashPlaintext is the throwaway password MustDummyHash hashes. It is never
+// a real credential; it exists only so the resulting PHC string carries the
+// CURRENT Argon2id parameters, giving the login enumeration-defense dummy
+// verification the same cost as a real one.
+const dummyHashPlaintext = "opengate: dummy password for login timing equalization — never a real credential"
+
+// MustDummyHash computes one Argon2id PHC hash at the current parameters, for the
+// login flow's enumeration-defense dummy verification (a missing tenant/user must
+// burn the same CPU as a real verify so latency does not betray account
+// existence). The composition root calls it ONCE at process start and injects the
+// result; it panics on failure because a hashing failure at boot is unrecoverable
+// and must not be papered over with a degenerate hash.
+func MustDummyHash() string {
+	h, err := HashPassword(dummyHashPlaintext)
+	if err != nil {
+		panic(fmt.Sprintf("auth: compute dummy hash: %v", err))
+	}
+	return h
+}
+
 // phcParams holds the parameters parsed from a PHC-formatted Argon2id string.
 type phcParams struct {
 	memoryKiB uint32
