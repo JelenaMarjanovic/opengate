@@ -19,6 +19,14 @@ type Config struct {
 	// most subcommands (e.g. migrate) do not need it, so making it mandatory
 	// would break them. The bootstrap subcommand validates its presence itself.
 	BypassRLSURL string `envconfig:"BYPASS_RLS_DATABASE_URL"`
+
+	// DatabaseURL is the DSN for the regular, RLS-bound request pool (System
+	// Design §22), consumed by postgres.NewPool. Like BypassRLSURL it is
+	// intentionally NOT required: the commands that exist today (migrate,
+	// bootstrap) do not open the regular pool, so making it mandatory would break
+	// them. Its future consumer (the serve command) validates its presence before
+	// opening the pool; NewPool itself fails fast on an empty or unparseable DSN.
+	DatabaseURL string `envconfig:"DATABASE_URL"`
 }
 
 // Load reads configuration from the environment. A parse failure returns an
