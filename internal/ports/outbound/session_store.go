@@ -42,9 +42,10 @@ type NewSession struct {
 }
 
 // SessionRecord is the projection FindByTokenHash returns: the session fields a
-// validated request needs. It deliberately omits TokenHash — the secret is
-// never needed after the lookup, and not carrying it keeps it out of logs and
-// structs (System Design §9).
+// validated request needs, plus the two tenant fields the same by-token lookup
+// folds in via a JOIN. It deliberately omits TokenHash — the secret is never
+// needed after the lookup, and not carrying it keeps it out of logs and structs
+// (System Design §9).
 type SessionRecord struct {
 	ID         uuid.UUID
 	TenantID   uuid.UUID
@@ -52,7 +53,17 @@ type SessionRecord struct {
 	Role       domain.Role
 	IssuedAt   time.Time
 	LastSeenAt time.Time
-	ExpiresAt  time.Time
+	// ExpiresAt is the session's current expiry; the validate use case compares
+	// it against now to decide whether the session is still live.
+	ExpiresAt time.Time
+	// SessionTimeout is the owning tenant's configured idle window, carried from
+	// the JOINed tenants row so the refresh use case can recompute the
+	// sliding-window expires_at = now + SessionTimeout without a second query.
+	SessionTimeout time.Duration
+	// TenantStatus is the owning tenant's CURRENT status (read live via the JOIN,
+	// not snapshotted at issue), so the validate use case can reject a session
+	// whose tenant has been suspended since it was issued (DB §5.1).
+	TenantStatus domain.TenantStatus
 }
 
 // SessionStore persists and retrieves session rows. Its methods straddle the
@@ -78,7 +89,9 @@ type SessionStore interface {
 
 	// FindByTokenHash resolves a session by the SHA-256 hash of its cookie
 	// token, returning ErrSessionNotFound if no row matches. Pre-authentication;
-	// bypass pool. The matched row's tenant_id is part of the result.
+	// bypass pool. The matched row's tenant_id is part of the result, and the same
+	// lookup folds in the owning tenant's SessionTimeout and TenantStatus via a
+	// JOIN so the validate/refresh use cases need no second query.
 	FindByTokenHash(ctx context.Context, tokenHash []byte) (SessionRecord, error)
 
 	// Refresh slides the session window by writing lastSeenAt and expiresAt for

@@ -79,7 +79,11 @@ func (s *SessionStore) Create(ctx context.Context, ns ports.NewSession) error {
 // (pre-authentication). A missing row yields ports.ErrSessionNotFound (mapped
 // from pgx.ErrNoRows); any other failure wraps apperr.ErrInternal. The matched
 // row's tenant_id is returned as part of the SessionRecord — it is the output of
-// this lookup, not an input.
+// this lookup, not an input. The query JOINs tenants, so the same row also
+// carries the tenant's session_timeout and status: the interval is converted to
+// a time.Duration via durationFromInterval (the SAME helper ResolveBySlug uses,
+// so the two interval call sites cannot diverge) and the status text is mapped
+// into the typed domain.TenantStatus.
 func (s *SessionStore) FindByTokenHash(ctx context.Context, tokenHash []byte) (ports.SessionRecord, error) {
 	row, err := s.bypass.FindSessionByTokenHash(ctx, tokenHash)
 	if err != nil {
@@ -89,13 +93,15 @@ func (s *SessionStore) FindByTokenHash(ctx context.Context, tokenHash []byte) (p
 		return ports.SessionRecord{}, fmt.Errorf("find session by token hash: %w: %w", apperr.ErrInternal, err)
 	}
 	return ports.SessionRecord{
-		ID:         row.ID,
-		TenantID:   row.TenantID,
-		UserID:     row.UserID,
-		Role:       domain.Role(row.Role),
-		IssuedAt:   row.IssuedAt.Time,
-		LastSeenAt: row.LastSeenAt.Time,
-		ExpiresAt:  row.ExpiresAt.Time,
+		ID:             row.ID,
+		TenantID:       row.TenantID,
+		UserID:         row.UserID,
+		Role:           domain.Role(row.Role),
+		IssuedAt:       row.IssuedAt.Time,
+		LastSeenAt:     row.LastSeenAt.Time,
+		ExpiresAt:      row.ExpiresAt.Time,
+		SessionTimeout: durationFromInterval(row.SessionTimeout),
+		TenantStatus:   domain.TenantStatus(row.Status),
 	}, nil
 }
 

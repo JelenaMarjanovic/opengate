@@ -26,6 +26,8 @@ func TestGeneratedQueriesSurface(t *testing.T) {
 	// the name and the signature at compile time.
 	_ = q.ResolveTenantBySlug
 	_ = q.FindUserByEmail
+	_ = q.UpdateUserPasswordHash
+	_ = q.UpdateUserLastLogin
 	_ = q.CreateSession
 	_ = q.FindSessionByTokenHash
 	_ = q.RefreshSession

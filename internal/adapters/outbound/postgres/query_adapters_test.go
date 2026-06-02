@@ -40,9 +40,11 @@ func TestQueryAdapters(t *testing.T) {
 	container := startMigratedContainer(ctx, t)
 	bypassPool := openBypassPool(ctx, t, container)
 	regularPool := openRegularPool(ctx, t, container)
+	superPool := openSuperuserPool(ctx, t, container)
 
 	tenantResolver := postgres.NewTenantResolver(bypassPool)
 	userReader := postgres.NewUserReader(bypassPool)
+	userWriter := postgres.NewUserWriter(bypassPool)
 	sessions := postgres.NewSessionStore(bypassPool, regularPool)
 
 	// A single instant, truncated to Postgres' microsecond resolution so
@@ -229,6 +231,179 @@ func TestQueryAdapters(t *testing.T) {
 			t.Errorf("B's session should survive A's cross-tenant attempts: %v", err)
 		}
 	})
+
+	t.Run("UpdatePasswordHash", func(t *testing.T) {
+		// A dedicated user so the mutation cannot disturb the shared fixtures the
+		// other subtests read.
+		uid := uuid.New()
+		seedUser(ctx, t, bypassPool, uid, tenantA, "rehash@example.test", "old-hash", false)
+
+		// Capture updated_at before the write so we can prove it advances. now()
+		// is the transaction timestamp, so the seed and the update — separate pool
+		// round trips, hence separate transactions — get strictly increasing values.
+		var beforeUpdatedAt time.Time
+		if err := bypassPool.QueryRow(ctx,
+			`SELECT updated_at FROM users WHERE id = $1`, uid,
+		).Scan(&beforeUpdatedAt); err != nil {
+			t.Fatalf("read updated_at before: %v", err)
+		}
+
+		const newHash = "$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdG5ld3NhbHQ$bmV3aGFzaG5ld2hhc2g"
+		if err := userWriter.UpdatePasswordHash(ctx, tenantA, uid, newHash); err != nil {
+			t.Fatalf("UpdatePasswordHash: %v", err)
+		}
+
+		var gotHash string
+		var afterUpdatedAt time.Time
+		if err := bypassPool.QueryRow(ctx,
+			`SELECT password_hash, updated_at FROM users WHERE id = $1`, uid,
+		).Scan(&gotHash, &afterUpdatedAt); err != nil {
+			t.Fatalf("read user after update: %v", err)
+		}
+		if gotHash != newHash {
+			t.Errorf("password_hash = %q, want %q", gotHash, newHash)
+		}
+		if !afterUpdatedAt.After(beforeUpdatedAt) {
+			t.Errorf("updated_at = %s, want strictly after %s", afterUpdatedAt, beforeUpdatedAt)
+		}
+
+		// A nonexistent user id reports zero rows -> ErrUserNotFound.
+		if err := userWriter.UpdatePasswordHash(ctx, tenantA, uuid.New(), newHash); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("nonexistent id: err = %v, want ErrUserNotFound", err)
+		}
+		// The right user id under the WRONG tenant also reports zero rows: the
+		// explicit tenant_id predicate scopes the write before RLS exists.
+		if err := userWriter.UpdatePasswordHash(ctx, tenantB, uid, newHash); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("wrong tenant: err = %v, want ErrUserNotFound", err)
+		}
+	})
+
+	t.Run("RecordLastLogin", func(t *testing.T) {
+		// A dedicated user; seedUser does not set last_login_at, so it starts NULL.
+		uid := uuid.New()
+		seedUser(ctx, t, bypassPool, uid, tenantA, "lastlogin@example.test", "hash-LL", false)
+
+		var nullBefore bool
+		if err := bypassPool.QueryRow(ctx,
+			`SELECT last_login_at IS NULL FROM users WHERE id = $1`, uid,
+		).Scan(&nullBefore); err != nil {
+			t.Fatalf("probe last_login_at NULL: %v", err)
+		}
+		if !nullBefore {
+			t.Fatalf("seeded user last_login_at is not NULL; want NULL")
+		}
+
+		// A known instant (base is already UTC, microsecond-truncated) so the
+		// round-tripped timestamptz compares exactly via time.Time.Equal.
+		when := base.Add(7 * time.Minute)
+		if err := userWriter.RecordLastLogin(ctx, tenantA, uid, when); err != nil {
+			t.Fatalf("RecordLastLogin: %v", err)
+		}
+
+		var got time.Time
+		if err := bypassPool.QueryRow(ctx,
+			`SELECT last_login_at FROM users WHERE id = $1`, uid,
+		).Scan(&got); err != nil {
+			t.Fatalf("read last_login_at: %v", err)
+		}
+		if !got.Equal(when) {
+			t.Errorf("last_login_at = %s, want %s", got, when)
+		}
+
+		// Wrong id / wrong tenant -> ErrUserNotFound.
+		if err := userWriter.RecordLastLogin(ctx, tenantA, uuid.New(), when); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("nonexistent id: err = %v, want ErrUserNotFound", err)
+		}
+		if err := userWriter.RecordLastLogin(ctx, tenantB, uid, when); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("wrong tenant: err = %v, want ErrUserNotFound", err)
+		}
+	})
+
+	t.Run("cross-tenant mutation blocked without RLS", func(t *testing.T) {
+		// Distinct users in each tenant. A mutation issued with tenant A's explicit
+		// tenantID but aimed at tenant B's user must match no row — the explicit
+		// tenant_id predicate (NOT RLS, which is not enabled yet) blocks it — and
+		// must leave B's row untouched. This mirrors the Step 3 session test.
+		uidA, uidB := uuid.New(), uuid.New()
+		seedUser(ctx, t, bypassPool, uidA, tenantA, "xtenant-a@example.test", "hash-XA", false)
+		seedUser(ctx, t, bypassPool, uidB, tenantB, "xtenant-b@example.test", "hash-XB", false)
+
+		if err := userWriter.UpdatePasswordHash(ctx, tenantA, uidB, "intruder-hash"); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("cross-tenant rehash: err = %v, want ErrUserNotFound", err)
+		}
+		if err := userWriter.RecordLastLogin(ctx, tenantA, uidB, base); !errors.Is(err, ports.ErrUserNotFound) {
+			t.Errorf("cross-tenant last-login: err = %v, want ErrUserNotFound", err)
+		}
+
+		// B's user is intact: hash unchanged, last_login_at still NULL.
+		var gotHash string
+		var lastLoginNull bool
+		if err := bypassPool.QueryRow(ctx,
+			`SELECT password_hash, last_login_at IS NULL FROM users WHERE id = $1`, uidB,
+		).Scan(&gotHash, &lastLoginNull); err != nil {
+			t.Fatalf("read B user: %v", err)
+		}
+		if gotHash != "hash-XB" || !lastLoginNull {
+			t.Errorf("B user after cross-tenant attempts = {hash:%q lastLoginNull:%v}; want {hash-XB true}",
+				gotHash, lastLoginNull)
+		}
+	})
+
+	t.Run("FindByTokenHash folds in tenant session_timeout and status", func(t *testing.T) {
+		// A dedicated tenant (45-minute timeout, active) and user, so suspending
+		// the tenant below cannot disturb the shared fixtures other subtests read.
+		jt := uuid.New()
+		seedTenant(ctx, t, bypassPool, jt, "Join Test Gym", "join-test-gym", 45*time.Minute)
+		ju := uuid.New()
+		seedUser(ctx, t, bypassPool, ju, jt, "join@example.test", "hash-J", false)
+		sid, hash := mintSession(ctx, t, sessions, jt, ju, base)
+
+		// The JOIN yields the tenant's session_timeout (as a time.Duration) and its
+		// CURRENT status in the same round trip.
+		rec, err := sessions.FindByTokenHash(ctx, hash)
+		if err != nil {
+			t.Fatalf("FindByTokenHash: %v", err)
+		}
+		if rec.ID != sid {
+			t.Fatalf("rec.ID = %s, want %s", rec.ID, sid)
+		}
+		if rec.SessionTimeout != 45*time.Minute {
+			t.Errorf("SessionTimeout = %s, want 45m0s", rec.SessionTimeout)
+		}
+		if rec.TenantStatus != domain.StatusActive {
+			t.Errorf("TenantStatus = %q, want active", rec.TenantStatus)
+		}
+
+		// Suspend the tenant out-of-band; the SAME lookup must now reflect it,
+		// because status is read live via the JOIN, not snapshotted at issue. This
+		// is what lets the validate use case (Step 4b) reject a session whose tenant
+		// was suspended after the session was minted. The flip runs on the superuser
+		// pool: opengate_bypass deliberately holds only SELECT+INSERT on tenants (a
+		// tenant's status is changed by an operator, not the app), so the test uses
+		// the bypass-capable superuser for this out-of-band write.
+		if _, err := superPool.Exec(ctx,
+			`UPDATE tenants SET status = 'suspended' WHERE id = $1`, jt,
+		); err != nil {
+			t.Fatalf("suspend tenant: %v", err)
+		}
+		rec2, err := sessions.FindByTokenHash(ctx, hash)
+		if err != nil {
+			t.Fatalf("FindByTokenHash after suspend: %v", err)
+		}
+		if rec2.TenantStatus != domain.StatusSuspended {
+			t.Errorf("after suspend, TenantStatus = %q, want suspended", rec2.TenantStatus)
+		}
+		// The status flip does not perturb the timeout the same row carries.
+		if rec2.SessionTimeout != 45*time.Minute {
+			t.Errorf("after suspend, SessionTimeout = %s, want 45m0s", rec2.SessionTimeout)
+		}
+
+		// A random unknown hash is still ErrSessionNotFound — the JOIN did not
+		// change the not-found contract.
+		if _, err := sessions.FindByTokenHash(ctx, tokenHash("join-never-issued")); !errors.Is(err, ports.ErrSessionNotFound) {
+			t.Errorf("unknown hash: err = %v, want ErrSessionNotFound", err)
+		}
+	})
 }
 
 // tokenHash returns the SHA-256 of seed as a byte slice, mirroring how the
@@ -331,6 +506,26 @@ func openRegularPool(ctx context.Context, t *testing.T, c *tcpostgres.PostgresCo
 	pool, err := postgres.NewPool(ctx, deriveAppDSN(ctx, t, c), observability.NewLogger(io.Discard, slog.LevelError))
 	if err != nil {
 		t.Fatalf("open regular pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// openSuperuserPool opens a pool as the container superuser. It is
+// bypass-capable and — unlike opengate_bypass, which holds only SELECT+INSERT on
+// tenants — may UPDATE tenants. Tests use it for out-of-band tenant mutations
+// (e.g. flipping status to 'suspended') that no application role is granted,
+// mirroring how the migration round-trip test seeds via the superuser
+// connection. The DSN is the container's own connection string.
+func openSuperuserPool(ctx context.Context, t *testing.T, c *tcpostgres.PostgresContainer) *pgxpool.Pool {
+	t.Helper()
+	dsn, err := c.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("superuser connection string: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open superuser pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool
