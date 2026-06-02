@@ -1,0 +1,46 @@
+# sqlc configuration (v2). Generates typed Go query functions from the SQL in
+# internal/adapters/outbound/postgres/queries against the schema defined by the
+# embedded goose migrations. Re-run `make generate` whenever a query or a
+# migration that a query depends on changes; the generated code is committed, so
+# CI builds it directly and does not require sqlc to be installed.
+#
+# See: https://docs.sqlc.dev/en/latest/reference/config.html
+version: "2"
+sql:
+  - engine: "postgresql"
+    # Schema source is the existing embedded migration files — sqlc reads the
+    # DDL there to type the queries, so there is no second copy of the schema to
+    # keep in sync. sqlc natively understands the goose `-- +goose Up`/`Down`
+    # annotations and parses ONLY the Up sections, ignoring the Down rollbacks
+    # (https://docs.sqlc.dev/en/latest/howto/ddl.html), so the migration files
+    # are used verbatim with no overrides or stripping.
+    schema: "internal/adapters/outbound/postgres/migrations"
+    queries: "internal/adapters/outbound/postgres/queries"
+    gen:
+      go:
+        # Dedicated generated package, imported by the flat postgres adapter
+        # package. It exports Queries, New(DBTX), and the typed row/param structs.
+        package: "db"
+        out: "internal/adapters/outbound/postgres/db"
+        # pgx/v5 driver: the generated code uses pgx types and a DBTX interface
+        # satisfiable by both *pgxpool.Pool and pgx.Tx. Required because the whole
+        # data layer is pgx, not database/sql.
+        sql_package: "pgx/v5"
+        # Map nullable SQL columns to Go pointers (*T) so the adapter can nil-check
+        # them cleanly. The only nullable columns reaching generated structs here
+        # are CreateSession's issued_from_ip (inet NULL) and user_agent (text NULL).
+        emit_pointers_for_null_types: true
+        # These structs are internal persistence rows, never JSON-serialized, so no
+        # struct tags are emitted. No Querier interface is needed: the adapter holds
+        # a concrete *Queries.
+        emit_json_tags: false
+        emit_interface: false
+        overrides:
+          # uuid columns map to github.com/google/uuid.UUID (the type used
+          # everywhere else in the codebase) instead of sqlc's default
+          # pgtype.UUID, so the adapter and ports speak one UUID type end to end.
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              package: "uuid"
+              type: "UUID"
