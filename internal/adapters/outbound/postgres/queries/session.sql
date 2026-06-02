@@ -17,11 +17,23 @@ INSERT INTO sessions (
 -- input — it is the output). Runs on the BYPASSRLS pool; the adapter does NOT
 -- call tenant.FromContext. token_hash is deliberately NOT selected back out: it
 -- is never needed after the lookup, and not returning it keeps the secret
--- material out of logs and structs. No row -> the adapter maps pgx.ErrNoRows to
--- ports.ErrSessionNotFound.
-SELECT id, tenant_id, user_id, role, issued_at, last_seen_at, expires_at
-FROM sessions
-WHERE token_hash = $1;
+-- material out of logs and structs.
+--
+-- Joined to tenants so ONE round trip also yields the tenant's session_timeout
+-- (the sliding-window expires_at = last_seen_at + session_timeout recompute the
+-- refresh use case needs) and status (so the validate use case can reject a
+-- session whose tenant was suspended since issue — DB §5.1). The JOIN is safe on
+-- the bypass pool: opengate_bypass holds SELECT on both sessions and tenants
+-- (create_app_roles). It is an INNER join and never drops a session, because
+-- sessions.tenant_id is NOT NULL REFERENCES tenants(id). No row -> the adapter
+-- maps pgx.ErrNoRows to ports.ErrSessionNotFound.
+SELECT
+    s.id, s.tenant_id, s.user_id, s.role,
+    s.issued_at, s.last_seen_at, s.expires_at,
+    t.session_timeout, t.status
+FROM sessions s
+JOIN tenants t ON t.id = s.tenant_id
+WHERE s.token_hash = $1;
 
 -- name: RefreshSession :execrows
 -- Post-authentication sliding-window refresh (System Design §7 convention). By

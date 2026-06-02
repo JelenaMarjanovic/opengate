@@ -9,6 +9,7 @@ import (
 	"context"
 
 	uuid "github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const findUserByEmail = `-- name: FindUserByEmail :one
@@ -55,4 +56,57 @@ func (q *Queries) FindUserByEmail(ctx context.Context, arg FindUserByEmailParams
 		&i.MustChangePassword,
 	)
 	return i, err
+}
+
+const updateUserLastLogin = `-- name: UpdateUserLastLogin :execrows
+UPDATE users
+SET last_login_at = $1
+WHERE id = $2 AND tenant_id = $3
+`
+
+type UpdateUserLastLoginParams struct {
+	LastLoginAt pgtype.Timestamptz
+	ID          uuid.UUID
+	TenantID    uuid.UUID
+}
+
+// Records the timestamp of a successful login. Pre-authentication, bypass pool,
+// same (id, tenant_id) belt-and-suspenders scoping as UpdateUserPasswordHash. The
+// timestamp is supplied by the caller (the use case owns the clock for
+// testability) rather than defaulting to now() in SQL, so tests can assert an
+// exact value. :execrows carries the same zero-rows -> ErrUserNotFound contract.
+func (q *Queries) UpdateUserLastLogin(ctx context.Context, arg UpdateUserLastLoginParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserLastLogin, arg.LastLoginAt, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateUserPasswordHash = `-- name: UpdateUserPasswordHash :execrows
+UPDATE users
+SET password_hash = $1, updated_at = now()
+WHERE id = $2 AND tenant_id = $3
+`
+
+type UpdateUserPasswordHashParams struct {
+	PasswordHash string
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+}
+
+// Replaces the stored Argon2id PHC hash for one user. Pre-authentication: runs
+// on the bypass pool during the login flow's rehash-on-login step. Scoped by the
+// explicit (id, tenant_id) pair; tenant_id is belt-and-suspenders alongside the
+// future RLS policy and is the only tenant scoping until US-02.05. The SET clause
+// assigns only the bound hash and now(); the new hash is supplied as a parameter
+// and is never computed or read in SQL. :execrows lets the adapter detect a no-op
+// (zero rows -> the user vanished, or the tenant did not match) and map it to
+// ports.ErrUserNotFound.
+func (q *Queries) UpdateUserPasswordHash(ctx context.Context, arg UpdateUserPasswordHashParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserPasswordHash, arg.PasswordHash, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
