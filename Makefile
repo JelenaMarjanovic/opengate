@@ -70,6 +70,35 @@ lint: $(GOLANGCI_LINT) ## Run golangci-lint over the entire module
 	@$(GOLANGCI_LINT) run ./...
 
 # ---------------------------------------------------------------------------
+# Code generation
+# ---------------------------------------------------------------------------
+
+# sqlc is pinned as a go `tool` directive in go.mod (same convention as
+# lefthook), so `go tool sqlc` runs the pinned version with no global install.
+# The generated code is COMMITTED, so this target only needs re-running when a
+# query in internal/adapters/outbound/postgres/queries or a migration a query
+# depends on changes. CI builds the committed output and does not invoke sqlc.
+.PHONY: generate
+generate: ## Regenerate sqlc typed queries (commit the result)
+	@echo "==> Running sqlc generate..."
+	@go tool sqlc generate
+	@echo "==> Done. Review and commit changes under internal/adapters/outbound/postgres/db/."
+
+# Drift check: regenerate and fail if the working tree changed, proving the
+# committed generated code matches the queries + schema. Kept OUT of `make ci`
+# on purpose — `make ci` must not depend on sqlc being runnable, so a missing or
+# broken sqlc binary can never break the main pipeline. Run it manually or as an
+# optional, non-blocking CI job.
+.PHONY: generate-check
+generate-check: generate ## Fail if `sqlc generate` would change committed code
+	@if ! git diff --quiet -- internal/adapters/outbound/postgres/db; then \
+		echo "Generated code is stale. Run 'make generate' and commit the result:"; \
+		git --no-pager diff --stat -- internal/adapters/outbound/postgres/db; \
+		exit 1; \
+	fi
+	@echo "==> Generated code is up to date."
+
+# ---------------------------------------------------------------------------
 # Build and test
 # ---------------------------------------------------------------------------
 
