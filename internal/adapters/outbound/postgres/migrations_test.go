@@ -3,7 +3,9 @@ package postgres_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,16 +91,92 @@ func TestMigrationsRoundTrip(t *testing.T) {
 		t.Fatalf("second up: %v", err)
 	}
 	assertSchemaPresent(t, db, true)
+
+	// US-02.03 Step 1 additions: the add_tenant_slug migration's column shape and
+	// its format CHECK behavior, asserted once on the fully-migrated schema.
+	assertSlugColumnConstraints(t, db)
+	assertSlugFormatCheck(t, db)
 }
 
 // assertSchemaPresent asserts the presence (want=true) or absence (want=false)
-// of the tenants and users tables and the opengate_bypass role together, so the
-// round-trip verifies the full surface the migrations create and tear down.
+// of the tenants, users, and sessions tables and the opengate_bypass role
+// together, so the round-trip verifies the full surface the migrations create
+// and tear down.
 func assertSchemaPresent(t *testing.T, db *sql.DB, want bool) {
 	t.Helper()
 	assertTableExists(t, db, "tenants", want)
 	assertTableExists(t, db, "users", want)
+	assertTableExists(t, db, "sessions", want)
 	assertRoleExists(t, db, "opengate_bypass", want)
+}
+
+// assertSlugColumnConstraints verifies the add_tenant_slug migration shaped the
+// tenants.slug column as required: present, NOT NULL, and covered by the
+// tenants_slug_unique UNIQUE constraint. These are structural assertions read
+// from the catalog, independent of any row data.
+func assertSlugColumnConstraints(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	// The column exists and is NOT NULL.
+	var isNullable string
+	err := db.QueryRow(
+		`SELECT is_nullable FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = 'tenants' AND column_name = 'slug'`,
+	).Scan(&isNullable)
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("tenants.slug column is missing")
+	}
+	if err != nil {
+		t.Fatalf("query tenants.slug nullability: %v", err)
+	}
+	if isNullable != "NO" {
+		t.Errorf("tenants.slug is_nullable = %q, want NO (NOT NULL)", isNullable)
+	}
+
+	// A UNIQUE constraint named tenants_slug_unique exists on tenants.
+	var hasUnique bool
+	err = db.QueryRow(
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.table_constraints
+			WHERE table_schema = 'public' AND table_name = 'tenants'
+			  AND constraint_type = 'UNIQUE' AND constraint_name = 'tenants_slug_unique'
+		)`,
+	).Scan(&hasUnique)
+	if err != nil {
+		t.Fatalf("query tenants_slug_unique existence: %v", err)
+	}
+	if !hasUnique {
+		t.Error("tenants_slug_unique UNIQUE constraint is missing")
+	}
+}
+
+// assertSlugFormatCheck proves tenants_slug_format_check accepts a well-formed
+// slug and rejects a malformed one (uppercase plus a space). It seeds via the
+// superuser test connection, which is bypass-capable; RLS is not enabled on
+// tenants at this step.
+func assertSlugFormatCheck(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	// A valid slug is accepted. gen_random_uuid() (Postgres core) supplies the PK
+	// so the test needs no uuid import; name/slug are the only non-default columns.
+	if _, err := db.Exec(
+		`INSERT INTO tenants (id, name, slug) VALUES (gen_random_uuid(), $1, $2)`,
+		"Acme Gym", "acme-gym",
+	); err != nil {
+		t.Fatalf("insert valid slug 'acme-gym': %v", err)
+	}
+
+	// A malformed slug (uppercase and a space) must be rejected by the CHECK.
+	_, err := db.Exec(
+		`INSERT INTO tenants (id, name, slug) VALUES (gen_random_uuid(), $1, $2)`,
+		"Bad", "Bad Slug",
+	)
+	if err == nil {
+		t.Fatal("insert of slug 'Bad Slug' succeeded; want a tenants_slug_format_check violation")
+	}
+	if !strings.Contains(err.Error(), "tenants_slug_format_check") {
+		t.Errorf("insert of slug 'Bad Slug' failed with %v; want a tenants_slug_format_check violation", err)
+	}
 }
 
 // assertTableExists checks the presence (or absence) of a public-schema table

@@ -71,7 +71,7 @@ func TestIdentityWriterCreateTenantWithOwner(t *testing.T) {
 
 	// --- AC1: a single CreateTenantWithOwner writes one tenant and one owner. ---
 	tenantID, ownerID := uuid.New(), uuid.New()
-	tn, err := domain.NewTenant(tenantID, "Acme Climbing")
+	tn, err := domain.NewTenant(tenantID, "Acme Climbing", "acme-climbing")
 	if err != nil {
 		t.Fatalf("new tenant: %v", err)
 	}
@@ -90,20 +90,21 @@ func TestIdentityWriterCreateTenantWithOwner(t *testing.T) {
 	assertRowCount(ctx, t, pool, "tenants", 1)
 	assertRowCount(ctx, t, pool, "users", 1)
 
-	// Tenant fields, including session_timeout decoded back into a time.Duration.
+	// Tenant fields, including the slug and session_timeout decoded back into a
+	// time.Duration.
 	var (
-		gotName, gotContact, gotTimezone, gotTenantStatus string
-		gotTimeout                                        time.Duration
+		gotName, gotSlug, gotContact, gotTimezone, gotTenantStatus string
+		gotTimeout                                                 time.Duration
 	)
 	if err := pool.QueryRow(ctx,
-		`SELECT name, contact_email, timezone, session_timeout, status FROM tenants WHERE id = $1`, tenantID,
-	).Scan(&gotName, &gotContact, &gotTimezone, &gotTimeout, &gotTenantStatus); err != nil {
+		`SELECT name, slug, contact_email, timezone, session_timeout, status FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&gotName, &gotSlug, &gotContact, &gotTimezone, &gotTimeout, &gotTenantStatus); err != nil {
 		t.Fatalf("read tenant row: %v", err)
 	}
-	if gotName != "Acme Climbing" || gotContact != "ops@acme.test" || gotTimezone != "UTC" ||
-		gotTimeout != 60*time.Minute || gotTenantStatus != "active" {
-		t.Errorf("tenant row = (%q, %q, %q, %s, %q); want (Acme Climbing, ops@acme.test, UTC, 1h0m0s, active)",
-			gotName, gotContact, gotTimezone, gotTimeout, gotTenantStatus)
+	if gotName != "Acme Climbing" || gotSlug != "acme-climbing" || gotContact != "ops@acme.test" ||
+		gotTimezone != "UTC" || gotTimeout != 60*time.Minute || gotTenantStatus != "active" {
+		t.Errorf("tenant row = (%q, slug=%q, %q, %q, %s, %q); want (Acme Climbing, acme-climbing, ops@acme.test, UTC, 1h0m0s, active)",
+			gotName, gotSlug, gotContact, gotTimezone, gotTimeout, gotTenantStatus)
 	}
 
 	// Owner fields — role MUST be 'owner' (AC1).
@@ -124,8 +125,10 @@ func TestIdentityWriterCreateTenantWithOwner(t *testing.T) {
 	}
 
 	// --- AC3: a second create with the SAME name is rejected, nothing written. ---
+	// A distinct slug ensures the in-tx name pre-check (not the slug constraint) is
+	// what rejects this duplicate, keeping the test focused on the name axis.
 	dupTenantID, dupOwnerID := uuid.New(), uuid.New()
-	dup, err := domain.NewTenant(dupTenantID, "Acme Climbing") // same name
+	dup, err := domain.NewTenant(dupTenantID, "Acme Climbing", "acme-climbing-2") // same name, different slug
 	if err != nil {
 		t.Fatalf("new duplicate tenant: %v", err)
 	}

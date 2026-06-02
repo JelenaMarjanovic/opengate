@@ -33,7 +33,7 @@ func TestBootstrapperRunBuildsOwnerAndHashes(t *testing.T) {
 	w := &fakeIdentityWriter{}
 	b := identity.NewBootstrapper(w)
 
-	if err := b.Run(context.Background(), "Acme Climbing", "owner@acme.test", "s3cret"); err != nil {
+	if err := b.Run(context.Background(), "Acme Climbing", "acme-climbing", "owner@acme.test", "s3cret"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !w.called {
@@ -41,6 +41,9 @@ func TestBootstrapperRunBuildsOwnerAndHashes(t *testing.T) {
 	}
 	if w.gotTenant.Name != "Acme Climbing" {
 		t.Errorf("tenant name = %q, want Acme Climbing", w.gotTenant.Name)
+	}
+	if w.gotTenant.Slug != "acme-climbing" {
+		t.Errorf("tenant slug = %q, want acme-climbing", w.gotTenant.Slug)
 	}
 	if w.gotOwner.Role != domain.RoleOwner {
 		t.Errorf("owner role = %q, want owner", w.gotOwner.Role)
@@ -67,7 +70,7 @@ func TestBootstrapperRunPropagatesTenantExists(t *testing.T) {
 	w := &fakeIdentityWriter{err: ports.ErrTenantExists}
 	b := identity.NewBootstrapper(w)
 
-	err := b.Run(context.Background(), "Acme", "owner@acme.test", "s3cret")
+	err := b.Run(context.Background(), "Acme", "acme", "owner@acme.test", "s3cret")
 	if !errors.Is(err, ports.ErrTenantExists) {
 		t.Errorf("Run err = %v, want ErrTenantExists", err)
 	}
@@ -79,7 +82,7 @@ func TestBootstrapperRunRejectsBadEmail(t *testing.T) {
 	w := &fakeIdentityWriter{}
 	b := identity.NewBootstrapper(w)
 
-	if err := b.Run(context.Background(), "Acme", "not-an-email", "s3cret"); err == nil {
+	if err := b.Run(context.Background(), "Acme", "acme", "not-an-email", "s3cret"); err == nil {
 		t.Fatal("expected error for malformed email")
 	}
 	if w.called {
