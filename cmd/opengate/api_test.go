@@ -103,8 +103,12 @@ func TestRunAPIBindErrorSurfaces(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = occupied.Close() })
 
+	// Both DSNs are syntactically valid but never dialed (pgxpool connects
+	// lazily), so the only failure reached is the listener bind on the occupied
+	// address — proving bind failures surface before the serve goroutine.
 	cfg := config.Config{
 		BypassRLSURL: "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
+		DatabaseURL:  "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
 		HTTPAddr:     occupied.Addr().String(),
 	}
 	logger := observability.NewLogger(io.Discard, slog.LevelError)
@@ -115,6 +119,25 @@ func TestRunAPIBindErrorSurfaces(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listen") {
 		t.Errorf("error %q does not identify the bind failure", err)
+	}
+}
+
+// TestRunAPIRequiresDatabaseDSN proves the api subcommand validates the regular
+// pool's DSN (DATABASE_URL) before acquiring any resource — the bypass DSN being
+// present is not sufficient. It mirrors TestRunAPIRequiresBypassDSN for the
+// second required DSN that landed with the post-auth pool in Step 5b.
+func TestRunAPIRequiresDatabaseDSN(t *testing.T) {
+	logger := observability.NewLogger(io.Discard, slog.LevelError)
+	cfg := config.Config{
+		BypassRLSURL: "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
+		HTTPAddr:     ":0",
+	}
+	err := runAPI(context.Background(), logger, cfg)
+	if err == nil {
+		t.Fatal("expected an error when DATABASE_URL is unset")
+	}
+	if !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Errorf("error %q does not name the missing variable", err)
 	}
 }
 
@@ -159,8 +182,12 @@ func TestAPIServerHealthEndpoints(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
+	// Health-only router: the Pinger is the bypass pool. The Authenticator is nil
+	// because this test exercises only /livez and /readyz, which never invoke it
+	// (the auth routes are registered but unreached). The full auth chain is
+	// covered by the integration test in auth_api_test.go.
 	srv := &http.Server{
-		Handler:           httpadapter.NewRouter(pool),
+		Handler:           httpadapter.NewRouter(httpadapter.Config{Pinger: pool}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	logger := observability.NewLogger(io.Discard, slog.LevelInfo)

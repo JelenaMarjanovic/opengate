@@ -38,7 +38,7 @@ func (s *spyPinger) callCount() int {
 // must not fail liveness.
 func TestLivenessDoesNotTouchDB(t *testing.T) {
 	pinger := &spyPinger{err: errors.New("liveness must not ping the database")}
-	router := NewRouter(pinger)
+	router := NewRouter(Config{Pinger: pinger})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, LivenessPath, nil)
@@ -62,7 +62,7 @@ func TestLivenessDoesNotTouchDB(t *testing.T) {
 // that it pings exactly once.
 func TestReadinessReachable(t *testing.T) {
 	pinger := &spyPinger{err: nil}
-	router := NewRouter(pinger)
+	router := NewRouter(Config{Pinger: pinger})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, ReadinessPath, nil)
@@ -85,7 +85,7 @@ func TestReadinessReachable(t *testing.T) {
 func TestReadinessUnreachable(t *testing.T) {
 	const pingErrText = "connection refused to host=secret-db"
 	pinger := &spyPinger{err: errors.New(pingErrText)}
-	router := NewRouter(pinger)
+	router := NewRouter(Config{Pinger: pinger})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, ReadinessPath, nil)

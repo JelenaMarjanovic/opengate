@@ -98,6 +98,20 @@ var defaultProblem = problemMapping{
 	detail:   "An internal error occurred.",
 }
 
+// validationProblem is the static mapping for a request-body validation failure
+// (422). Unlike the rows in problemTable it is keyed to no domain sentinel — a
+// validation failure is detected in the handler, not surfaced as a domain error
+// — so it is rendered directly via WriteValidationProblem with the field-level
+// errors extension. Its detail is generic; the per-field specifics travel in the
+// errors array, which (per Step 5a) is safe to expose: "email is required" is
+// not enumeration-sensitive the way a credential outcome is.
+var validationProblem = problemMapping{
+	typeSlug: "validation-failed",
+	title:    "Validation failed",
+	status:   http.StatusUnprocessableEntity,
+	detail:   "The request body failed validation. See errors for details.",
+}
+
 // problemTable is the error-mapping table: the single place domain (and the
 // readiness) errors are translated to HTTP semantics (System Design §22).
 // Resolution is by errors.Is, so a wrapped sentinel still matches; the first
@@ -151,7 +165,7 @@ func mappingFor(err error) problemMapping {
 }
 
 // WriteProblem writes err as an RFC 9457 Problem Details response. It is the
-// single entry point inbound handlers use to render an error. The process
+// single entry point inbound handlers use to render a domain error. The process
 // default logger (set as slog.Default at the composition root, where it is the
 // trace/tenant-enriching, secret-redacting handler) receives the server-side log.
 func WriteProblem(w http.ResponseWriter, r *http.Request, err error) {
@@ -159,29 +173,51 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // writeProblem is the testable core of WriteProblem with the logger injected so
-// a test can capture and assert the server-side record. The flow is:
-//
-//  1. Resolve err to its static mapping (mappingFor), defaulting to a 500.
-//  2. Build the body from the STATIC mapping — never from err — so no error
-//     message (which for a wrapped pgx error could carry parameter values)
-//     reaches the client.
-//  3. Compute trace_id best-effort: include it only when the request carries a
-//     valid span context; otherwise omit the field.
-//  4. Log server-side at warn (4xx) or error (5xx), carrying the problem type
-//     and err.Error(). trace_id is attached by the context handler from
-//     r.Context(), so it matches the trace_id in the response body. We log
-//     err.Error() only — which for a pgconn.PgError omits its Detail field — and
-//     do NOT extract pgx-specific detail, the request body, headers, or cookies.
-//  5. Write the status and JSON body with the problem+json content type.
+// a test can capture and assert the server-side record. It resolves err to its
+// static mapping (defaulting to a 500) and renders it; the log line carries
+// err.Error() — which for a pgconn.PgError omits its Detail field — and NOT any
+// pgx-specific detail, request body, headers, or cookies.
 func writeProblem(w http.ResponseWriter, r *http.Request, err error, logger *slog.Logger) {
-	mapping := mappingFor(err)
+	renderProblem(w, r, mappingFor(err), nil, err.Error(), logger)
+}
 
+// WriteValidationProblem writes a 422 Problem Details for a request-body
+// validation failure, carrying the field-level errors extension (RFC 9457). It
+// is the second handler-facing entry point alongside WriteProblem: validation
+// failures are not domain errors, so they have no sentinel and are rendered from
+// the static validationProblem mapping. Detailed field errors are intentionally
+// exposed here — a missing/empty field is not enumeration-sensitive, whereas a
+// credential outcome stays uniform via WriteProblem(ErrInvalidCredentials).
+func WriteValidationProblem(w http.ResponseWriter, r *http.Request, fieldErrors []FieldError) {
+	writeValidationProblem(w, r, fieldErrors, slog.Default())
+}
+
+// writeValidationProblem is the testable core of WriteValidationProblem.
+func writeValidationProblem(w http.ResponseWriter, r *http.Request, fieldErrors []FieldError, logger *slog.Logger) {
+	renderProblem(w, r, validationProblem, fieldErrors, "request validation failed", logger)
+}
+
+// renderProblem is the shared rendering core behind both writeProblem and
+// writeValidationProblem. The flow is:
+//
+//  1. Build the body from the STATIC mapping — never from a runtime error — so no
+//     error message (which for a wrapped pgx error could carry parameter values)
+//     reaches the client. Any field errors are attached verbatim (the caller is
+//     responsible for keeping them non-sensitive).
+//  2. Compute trace_id best-effort: include it only when the request carries a
+//     valid span context; otherwise omit the field.
+//  3. Log server-side at warn (4xx) or error (5xx), carrying the problem type and
+//     the caller-supplied logErr. trace_id/tenant_id are attached by the context
+//     handler from r.Context(), so the log correlates with the response body.
+//  4. Write the status and JSON body with the problem+json content type.
+func renderProblem(w http.ResponseWriter, r *http.Request, mapping problemMapping, fieldErrors []FieldError, logErr string, logger *slog.Logger) {
 	pd := ProblemDetails{
 		Type:     mapping.typeURI(),
 		Title:    mapping.title,
 		Status:   mapping.status,
 		Detail:   mapping.detail,
 		Instance: r.URL.Path,
+		Errors:   fieldErrors,
 	}
 
 	// Best-effort trace id: only attach a valid one. With no OTel SDK wired there
@@ -202,7 +238,7 @@ func writeProblem(w http.ResponseWriter, r *http.Request, err error, logger *slo
 
 	// Server-side log per §22: warn for client mistakes (4xx), error for server
 	// failures (5xx). The redacting context handler adds trace_id/tenant_id; we
-	// pass only err.Error(), keeping any pgx Detail out of the logged string.
+	// pass only the caller's logErr, keeping any pgx Detail out of the logged string.
 	level := slog.LevelWarn
 	if mapping.status >= http.StatusInternalServerError {
 		level = slog.LevelError
@@ -210,7 +246,7 @@ func writeProblem(w http.ResponseWriter, r *http.Request, err error, logger *slo
 	logger.LogAttrs(r.Context(), level, "http problem response",
 		slog.Int("status", mapping.status),
 		slog.String("type", pd.Type),
-		slog.String("error", err.Error()),
+		slog.String("error", logErr),
 	)
 
 	w.Header().Set("Content-Type", contentTypeProblemJSON)

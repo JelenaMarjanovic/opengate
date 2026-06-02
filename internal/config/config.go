@@ -41,6 +41,16 @@ type Config struct {
 	// and the §23 HTTP_ADDR naming, rather than the OPENGATE_-prefixed names used
 	// by the CLI-only vars read directly via os.Getenv (e.g. OPENGATE_DATABASE_URL).
 	HTTPAddr string `envconfig:"HTTP_ADDR" default:":8080"`
+
+	// CookieSecure controls the Secure attribute (and the __Host- name prefix) of
+	// the session cookie the api subcommand issues. It defaults to TRUE because
+	// production terminates TLS at Caddy (US-01.03) and a session cookie must be
+	// HTTPS-only and __Host--prefixed there. It exists as a knob solely so the
+	// integration tests, which round-trip the cookie over plain HTTP via httptest,
+	// can set it FALSE — a Secure cookie is not returned by a standard client over
+	// HTTP, which would break the AC-2/AC-3/AC-4 cookie round-trips. Never set it
+	// false in a real deployment. See the inbound http adapter's cookie.go.
+	CookieSecure bool `envconfig:"COOKIE_SECURE" default:"true"`
 }
 
 // Load reads configuration from the environment. A parse failure returns an

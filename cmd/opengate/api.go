@@ -15,6 +15,8 @@ import (
 
 	httpadapter "github.com/JelenaMarjanovic/opengate/internal/adapters/inbound/http"
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
+	appauth "github.com/JelenaMarjanovic/opengate/internal/application/auth"
+	"github.com/JelenaMarjanovic/opengate/internal/auth"
 	"github.com/JelenaMarjanovic/opengate/internal/config"
 )
 
@@ -43,40 +45,73 @@ type poolCloser interface {
 	Close()
 }
 
-// runAPI implements `opengate api`: it serves the HTTP surface (this step: the
-// health endpoints) until a SIGTERM/SIGINT triggers a graceful shutdown.
+// runAPI implements `opengate api`: it serves the full US-02.03 HTTP surface —
+// the health probes plus the authenticated login/logout/whoami chain — until a
+// SIGTERM/SIGINT triggers a graceful shutdown. It is the composition root (System
+// Design §7): the only place that imports both the outbound adapters and the
+// application layer, assembling the Authenticator from ports and injected
+// collaborators and handing it to the inbound HTTP adapter.
 //
-// Pool note (US-02.03 Step 5a): this step builds ONLY the bypass pool and uses
-// it for the readiness probe. The api command will ultimately need both pools —
-// the bypass pool for pre-auth lookups and the regular RLS-bound pool
-// (postgres.NewPool) for post-auth refresh/delete — but the regular pool is
-// deferred to Step 5b for two reasons. First, this step has no consumer for it,
-// and a constructed-but-unused pool is dead code the linter rejects. Second, and
-// more importantly, the regular pool's acquire hook logs a "no tenant in
-// context" warning on every tenant-less acquire; a readiness probe has no tenant,
-// so routing it through the regular pool would spam that warning every few
-// seconds. Readiness therefore pings the bypass pool, which installs no hooks.
-// General principle for this command: the regular pool is acquired only on
-// tenant-scoped post-auth paths where the session middleware has set the tenant
-// context; tenant-less operations (readiness, future operator paths) use the
-// bypass pool. The regular pool joins the composition root in Step 5b when the
-// Authenticator (and its DATABASE_URL config) lands.
+// Two pools (System Design §10):
+//   - The BYPASS pool backs the readiness probe and every pre-authentication
+//     lookup (tenant resolve, user read/write, session create + by-token find). It
+//     installs no tenant-binding hooks, so the tenant-less readiness ping does not
+//     spam a "no tenant in context" warning.
+//   - The regular RLS-bound pool (postgres.NewPool) backs the post-authentication
+//     writes (session refresh + delete). Its acquire hook binds the tenant the
+//     session middleware set on the request context. It is acquired ONLY on those
+//     tenant-scoped paths, never for readiness — so the warning above never fires
+//     in normal operation.
+//
+// Both pools are closed as the final shutdown phase (see serveAPI), or eagerly
+// below if a later construction step fails, so neither is leaked on any path.
 func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
-	// BypassRLSURL is optional in config (migrate must not require it), so the
-	// subcommand that needs it validates its presence here, mirroring bootstrap.
+	// Validate both DSNs before acquiring any resource. They are optional in
+	// config (migrate must not require them), so the api subcommand validates the
+	// pair it needs here, mirroring bootstrap.
 	if cfg.BypassRLSURL == "" {
 		return errors.New("api: BYPASS_RLS_DATABASE_URL is not set")
 	}
+	if cfg.DatabaseURL == "" {
+		return errors.New("api: DATABASE_URL is not set")
+	}
 
-	pool, err := postgres.NewBypassPool(ctx, cfg.BypassRLSURL)
+	bypass, err := postgres.NewBypassPool(ctx, cfg.BypassRLSURL)
 	if err != nil {
 		return fmt.Errorf("api: %w", err)
 	}
-	// NOTE: the pool is closed by serveAPI as the final shutdown phase (so the
-	// close is logged in order), or below if binding the listener fails. It is
-	// deliberately NOT deferred here, to avoid a double Close.
+	// NOTE: the pools are closed by serveAPI as the final shutdown phase (so the
+	// closes are logged in order), or eagerly on the error paths below. They are
+	// deliberately NOT deferred here, to avoid a double Close on the happy path.
 
-	router := httpadapter.NewRouter(pool)
+	regular, err := postgres.NewPool(ctx, cfg.DatabaseURL, logger)
+	if err != nil {
+		bypass.Close()
+		return fmt.Errorf("api: %w", err)
+	}
+
+	// Composition root: assemble the Authenticator from the outbound adapters and
+	// the injected collaborators. VerifyPassword/HashPassword/MustDummyHash come
+	// from internal/auth (crypto); VerifierFunc/HasherFunc/CryptoRandToken from the
+	// application layer. time.Now is the production clock.
+	authenticator := appauth.NewAuthenticator(
+		postgres.NewTenantResolver(bypass),
+		postgres.NewUserReader(bypass),
+		postgres.NewUserWriter(bypass),
+		postgres.NewSessionStore(bypass, regular),
+		appauth.VerifierFunc(auth.VerifyPassword),
+		appauth.HasherFunc(auth.HashPassword),
+		time.Now,
+		appauth.CryptoRandToken,
+		auth.MustDummyHash(),
+		logger,
+	)
+
+	router := httpadapter.NewRouter(httpadapter.Config{
+		Pinger:        bypass,
+		Authenticator: authenticator,
+		CookieSecure:  cfg.CookieSecure,
+	})
 
 	srv := &http.Server{
 		Handler:           router,
@@ -92,7 +127,8 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	// tests). srv.Serve(ln) — not ListenAndServe — consumes this listener.
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
-		pool.Close()
+		regular.Close()
+		bypass.Close()
 		return fmt.Errorf("api: listen on %s: %w", cfg.HTTPAddr, err)
 	}
 
@@ -103,20 +139,31 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	defer stop()
 
 	logger.InfoContext(ctx, "api: http server listening", slog.String("addr", ln.Addr().String()))
-	return serveAPI(signalCtx, logger, srv, ln, pool)
+	// Close order at shutdown: regular (request) pool first, then bypass.
+	return serveAPI(signalCtx, logger, srv, ln, regular, bypass)
 }
 
 // serveAPI runs srv on ln until shutdownCtx is canceled (in production, by a
 // signal), then performs the minimal §21 shutdown subset for this step: drain
-// the HTTP server with a bounded timeout, then close the pool. The full
-// multi-phase sequence (River worker drain, SSE drain, OTel flush, readiness
-// flip) accretes as those components land.
+// the HTTP server with a bounded timeout, then close the pools (in the order
+// given). The full multi-phase sequence (River worker drain, SSE drain, OTel
+// flush, readiness flip) accretes as those components land.
+//
+// pools is variadic so the api command can pass BOTH the regular and the bypass
+// pool while the lifecycle tests pass a single spy poolCloser. Each is closed
+// exactly once, in argument order, as the final phase.
 //
 // It is split from runAPI so a test can drive shutdown by canceling shutdownCtx
 // and inject a spy poolCloser. shutdownCtx is the cancellation trigger, not a
 // deadline; the drain deadline is a fresh background-derived context so it is not
 // already-canceled when shutdown begins.
-func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server, ln net.Listener, pool poolCloser) error {
+func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server, ln net.Listener, pools ...poolCloser) error {
+	closeAll := func() {
+		for _, p := range pools {
+			p.Close()
+		}
+	}
+
 	// Buffered so the serve goroutine never blocks on send even if we have already
 	// taken the shutdown branch of the select.
 	serverErr := make(chan error, 1)
@@ -130,8 +177,8 @@ func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server
 	select {
 	case err := <-serverErr:
 		// A serve failure with no shutdown in progress (e.g. the listener died).
-		// Close the pool and surface the error so the process exits non-zero.
-		pool.Close()
+		// Close the pools and surface the error so the process exits non-zero.
+		closeAll()
 		return fmt.Errorf("api: serve: %w", err)
 	case <-shutdownCtx.Done():
 		logger.Info("api: shutdown signal received, draining in-flight requests")
@@ -154,8 +201,8 @@ func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server
 	}
 
 	// Phase: database pool close. By now no checkouts are in progress.
-	logger.Info("api: closing database pool")
-	pool.Close()
+	logger.Info("api: closing database pools")
+	closeAll()
 	logger.Info("api: shutdown complete")
 	return nil
 }
