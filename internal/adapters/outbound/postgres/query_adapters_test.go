@@ -465,7 +465,16 @@ func startMigratedContainer(ctx context.Context, t *testing.T) *tcpostgres.Postg
 		tcpostgres.WithUsername("test"),
 		tcpostgres.WithPassword("test"),
 		testcontainers.WithWaitStrategy(
-			wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
+			// Wait for the readiness log to appear TWICE — the postgres entrypoint
+			// starts a temporary server for initdb (first occurrence) then restarts
+			// the real one (second). Waiting only for the listening port races that
+			// restart and yields "connection reset by peer" on the first query; the
+			// occurrence-2 log wait (the testcontainers postgres-module default) is robust.
+			wait.ForAll(
+				wait.ForLog("database system is ready to accept connections").
+					WithOccurrence(2).WithStartupTimeout(60*time.Second),
+				wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
+			),
 		),
 	)
 	if err != nil {
