@@ -96,6 +96,40 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	// its format CHECK behavior, asserted once on the fully-migrated schema.
 	assertSlugColumnConstraints(t, db)
 	assertSlugFormatCheck(t, db)
+
+	// US-02.03 Step 2 addition: the grant_app_sessions migration's privileges on
+	// the application role. Asserted after the second up (so the round-trip also
+	// exercised this migration's REVOKE on the way down and GRANT on the way up).
+	assertAppSessionGrants(t, db)
+}
+
+// assertAppSessionGrants verifies the grant_app_sessions migration gave
+// opengate_app exactly UPDATE and DELETE on sessions — the privileges the
+// authenticated session paths need — and withheld INSERT and SELECT (sessions
+// are minted and looked up on the bypass pool, so the application role must not
+// be able to forge or read them yet). Read from the catalog via
+// has_table_privilege, independent of any row data.
+func assertAppSessionGrants(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, c := range []struct {
+		// query is a static, in-test constant (no user input), so it is safe to
+		// pass to has_table_privilege as a literal.
+		query string
+		want  bool
+	}{
+		{`SELECT has_table_privilege('opengate_app', 'sessions', 'UPDATE')`, true},
+		{`SELECT has_table_privilege('opengate_app', 'sessions', 'DELETE')`, true},
+		{`SELECT has_table_privilege('opengate_app', 'sessions', 'INSERT')`, false},
+		{`SELECT has_table_privilege('opengate_app', 'sessions', 'SELECT')`, false},
+	} {
+		var has bool
+		if err := db.QueryRow(c.query).Scan(&has); err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		if has != c.want {
+			t.Errorf("%s = %v, want %v", c.query, has, c.want)
+		}
+	}
 }
 
 // assertSchemaPresent asserts the presence (want=true) or absence (want=false)
