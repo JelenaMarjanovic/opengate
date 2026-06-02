@@ -98,6 +98,11 @@ type Principal struct {
 	Role      domain.Role
 	SessionID uuid.UUID
 	ExpiresAt time.Time
+	// SessionTimeout is the owning tenant's configured idle window, carried out
+	// of the by-token lookup so the middleware can slide the window via Refresh
+	// (which takes the timeout as an argument) WITHOUT a second tenant query. It
+	// is identity-adjacent metadata, not a secret.
+	SessionTimeout time.Duration
 }
 
 // Login verifies a credential and, on success, mints a session. The control flow
@@ -285,13 +290,16 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Princip
 
 	// 5. Valid. Role is the session snapshot (decision 2). Refreshing the window
 	// is a separate post-authentication write (Refresh), sequenced by the
-	// middleware after it sets the tenant context.
+	// middleware after it sets the tenant context. SessionTimeout is carried out
+	// of the JOINed record so the middleware can pass it to Refresh without a
+	// re-query.
 	return Principal{
-		TenantID:  record.TenantID,
-		UserID:    record.UserID,
-		Role:      record.Role,
-		SessionID: record.ID,
-		ExpiresAt: record.ExpiresAt,
+		TenantID:       record.TenantID,
+		UserID:         record.UserID,
+		Role:           record.Role,
+		SessionID:      record.ID,
+		ExpiresAt:      record.ExpiresAt,
+		SessionTimeout: record.SessionTimeout,
 	}, nil
 }
 

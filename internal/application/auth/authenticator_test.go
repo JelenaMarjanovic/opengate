@@ -556,6 +556,11 @@ func TestAuthenticateSuccess(t *testing.T) {
 	if !p.ExpiresAt.Equal(fixedNow.Add(timeout)) {
 		t.Errorf("principal ExpiresAt = %v, want %v", p.ExpiresAt, fixedNow.Add(timeout))
 	}
+	// SessionTimeout is carried out of the JOINed record so the middleware can
+	// pass it straight to Refresh without a second tenant query (Task 0).
+	if p.SessionTimeout != timeout {
+		t.Errorf("principal SessionTimeout = %v, want %v", p.SessionTimeout, timeout)
+	}
 	// The lookup hash must be the SHA-256 of the raw bytes.
 	wantHash := sha256.Sum256(rawToken)
 	if !bytes.Equal(h.sessions.gotFindHash, wantHash[:]) {
