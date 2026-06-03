@@ -171,16 +171,41 @@ func handleWhoami(w http.ResponseWriter, r *http.Request) {
 
 // clientIP extracts the originating client IP for the session's forensic record.
 //
-// Trusted-proxy assumption: Caddy terminates TLS in front of the app (US-01.03),
-// so r.RemoteAddr is the proxy and the real client is the FIRST entry of
-// X-Forwarded-For. This is only sound because the app is never exposed directly;
-// were it reachable without the proxy, X-Forwarded-For would be client-spoofable
-// and must not be trusted. We prefer the XFF client, fall back to RemoteAddr, and
-// return the zero Addr if neither parses — the use case maps a zero IP to SQL NULL.
+// Trusted-proxy assumption: EXACTLY ONE trusted reverse proxy (Caddy, US-01.03)
+// sits in front of the app as the first hop and terminates TLS. Caddy does NOT
+// trust incoming X-Forwarded-* values by default — that default exists precisely to
+// prevent spoofing, and the sanctioned way to get a real client IP behind Caddy is
+// the trusted_proxies global option (with trusted_proxies_strict for upstreams that
+// append). What we read here is the *forwarded* header itself: when Caddy proxies a
+// request it appends the address it observed to the RIGHT of X-Forwarded-For, so
+// with a single trusted first-hop proxy the rightmost entry is Caddy's observed
+// client IP. A client can only inject entries to the left of it, so the rightmost is
+// not client-forgeable. We read it, fall back to RemoteAddr when X-Forwarded-For is
+// absent or unparseable, and return the zero Addr if neither parses — the use case
+// maps a zero IP to SQL NULL.
+//
+// This holds ONLY for a single trusted first-hop proxy. Put a CDN, load balancer, or
+// any proxy chain in front and the rightmost entry becomes the nearest proxy rather
+// than the client; whoever adds one must revisit this extraction.
+//
+// Stopgap: reading raw X-Forwarded-For is provisional — no /api/ reverse_proxy block
+// exists in deploy/Caddyfile yet (it lands in a later epic). The proper fix, when
+// that block is introduced, is to configure trusted_proxies and have Caddy emit the
+// parsed client IP into a dedicated header — header_up X-Real-IP
+// {http.request.remote.host} for a first-hop Caddy, or {client_ip} once
+// trusted_proxies is set — then read that dedicated header here, falling back to this
+// X-Forwarded-For logic and then to RemoteAddr.
 func clientIP(r *http.Request) netip.Addr {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first, _, _ := strings.Cut(xff, ",")
-		if addr, err := netip.ParseAddr(strings.TrimSpace(first)); err == nil {
+	// Join every X-Forwarded-For line into one comma list, because a client may
+	// send the header multiple times and Get() would see only the first line.
+	// The rightmost entry across all lines is the address our single trusted
+	// first-hop proxy observed and appended; a client can only inject entries to
+	// its left, so the rightmost is not client-forgeable. LastIndex returns -1 for
+	// a single-entry list, so last is then the whole (trimmed) string.
+	xff := strings.Join(r.Header.Values("X-Forwarded-For"), ",")
+	if xff != "" {
+		last := strings.TrimSpace(xff[strings.LastIndex(xff, ",")+1:])
+		if addr, err := netip.ParseAddr(last); err == nil {
 			return addr
 		}
 	}
