@@ -13,15 +13,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
 	"github.com/JelenaMarjanovic/opengate/internal/domain"
 	"github.com/JelenaMarjanovic/opengate/internal/observability"
 	ports "github.com/JelenaMarjanovic/opengate/internal/ports/outbound"
 	"github.com/JelenaMarjanovic/opengate/internal/tenant"
+	"github.com/JelenaMarjanovic/opengate/internal/testsupport"
 )
 
 // TestQueryAdapters exercises the Step 3 query-layer adapters against a real
@@ -459,33 +458,7 @@ func seedUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id, tenantI
 // migration as the superuser (needed for the CREATE ROLE in create_app_roles).
 func startMigratedContainer(ctx context.Context, t *testing.T) *tcpostgres.PostgresContainer {
 	t.Helper()
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16.14-bookworm",
-		tcpostgres.WithDatabase("opengate_test"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		testcontainers.WithWaitStrategy(
-			// Wait for the readiness log to appear TWICE — the postgres entrypoint
-			// starts a temporary server for initdb (first occurrence) then restarts
-			// the real one (second). Waiting only for the listening port races that
-			// restart and yields "connection reset by peer" on the first query; the
-			// occurrence-2 log wait (the testcontainers postgres-module default) is robust.
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := container.Terminate(ctx); err != nil {
-			t.Logf("terminate container: %v", err)
-		}
-	})
-
+	container := testsupport.StartPostgres(ctx, t)
 	superDSN, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		t.Fatalf("super connection string: %v", err)

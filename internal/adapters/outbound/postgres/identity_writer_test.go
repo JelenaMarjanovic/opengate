@@ -13,13 +13,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
 	"github.com/JelenaMarjanovic/opengate/internal/domain"
 	ports "github.com/JelenaMarjanovic/opengate/internal/ports/outbound"
+	"github.com/JelenaMarjanovic/opengate/internal/testsupport"
 )
 
 // TestIdentityWriterCreateTenantWithOwner exercises the bootstrap adapter
@@ -33,32 +32,7 @@ func TestIdentityWriterCreateTenantWithOwner(t *testing.T) {
 
 	ctx := context.Background()
 
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16.14-bookworm",
-		tcpostgres.WithDatabase("opengate_test"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		testcontainers.WithWaitStrategy(
-			// Wait for the readiness log to appear TWICE — the postgres entrypoint
-			// starts a temporary server for initdb (first occurrence) then restarts
-			// the real one (second). Waiting only for the listening port races that
-			// restart and yields "connection reset by peer" on the first query; the
-			// occurrence-2 log wait (the testcontainers postgres-module default) is robust.
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := container.Terminate(ctx); err != nil {
-			t.Logf("terminate container: %v", err)
-		}
-	})
+	container := testsupport.StartPostgres(ctx, t)
 
 	// Run ALL migrations up as the container superuser. The superuser is needed
 	// because create_app_roles issues CREATE ROLE.

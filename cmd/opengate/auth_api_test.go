@@ -21,15 +21,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver for goose
 	"github.com/pressly/goose/v3"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	httpadapter "github.com/JelenaMarjanovic/opengate/internal/adapters/inbound/http"
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
 	appauth "github.com/JelenaMarjanovic/opengate/internal/application/auth"
 	"github.com/JelenaMarjanovic/opengate/internal/auth"
 	"github.com/JelenaMarjanovic/opengate/internal/observability"
+	"github.com/JelenaMarjanovic/opengate/internal/testsupport"
 )
 
 // sessionCookieName is the cookie name the api issues when CookieSecure is false
@@ -618,33 +617,7 @@ func mustHash(t *testing.T, plaintext string) string {
 
 func startMigratedPostgres(ctx context.Context, t *testing.T) *tcpostgres.PostgresContainer {
 	t.Helper()
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16.14-bookworm",
-		tcpostgres.WithDatabase("opengate_test"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		testcontainers.WithWaitStrategy(
-			// Wait for the readiness log to appear TWICE — the postgres entrypoint
-			// starts a temporary server for initdb (first occurrence) then restarts
-			// the real one (second). Waiting only for the listening port races that
-			// restart and yields "connection reset by peer" on the first query; the
-			// occurrence-2 log wait (the testcontainers postgres-module default) is robust.
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := container.Terminate(ctx); err != nil {
-			t.Logf("terminate container: %v", err)
-		}
-	})
-
+	container := testsupport.StartPostgres(ctx, t)
 	applyMigrations(ctx, t, superConnString(ctx, t, container))
 	return container
 }
