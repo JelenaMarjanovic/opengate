@@ -87,6 +87,11 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	// privilege on users for the bypass role. Asserted after the second up, so the
 	// round-trip also exercised its REVOKE (down) and GRANT (up).
 	assertBypassUsersUpdateGrant(t, db)
+
+	// US-02.04 Step 1 addition: the create_casbin_rules migration's seeded v1
+	// policy. Asserted after the second up so the round-trip also re-applied the
+	// INSERT after a full Down, proving the seed is part of the repeatable Up.
+	assertCasbinPolicySeeded(t, db)
 }
 
 // assertAppSessionGrants verifies the grant_app_sessions migration gave
@@ -145,15 +150,66 @@ func assertBypassUsersUpdateGrant(t *testing.T, db *sql.DB) {
 	}
 }
 
+// assertCasbinPolicySeeded verifies the create_casbin_rules migration seeded the
+// v1 authorization policy that step 3's enforcer will rest on. The spot-checks
+// are the meaningful part: they assert specific (role, resource, action)
+// semantics, not merely that some rows exist. casbin_rules is a global table (no
+// tenant_id, no RLS), so the superuser test connection reads every row directly.
+func assertCasbinPolicySeeded(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	// Each case is a presence/absence check on a policy ('p') row matched on
+	// v0=role, v1=resource (object), v2=action -- the four semantics step 3 will
+	// enforce: the owner wildcard grants everything; a manager may write members;
+	// an auditor may read members but must NOT be able to write them.
+	for _, c := range []struct {
+		role, resource, action string
+		want                   bool
+	}{
+		{"owner", "*", "*", true},              // owner wildcard -> full access
+		{"manager", "members", "write", true},  // manager may write members
+		{"auditor", "members", "read", true},   // auditor may read members
+		{"auditor", "members", "write", false}, // auditor must NOT write members
+	} {
+		var exists bool
+		err := db.QueryRow(
+			`SELECT EXISTS (
+				SELECT 1 FROM casbin_rules
+				WHERE ptype = 'p' AND v0 = $1 AND v1 = $2 AND v2 = $3
+			)`, c.role, c.resource, c.action,
+		).Scan(&exists)
+		if err != nil {
+			t.Fatalf("query casbin rule (%s, %s, %s): %v", c.role, c.resource, c.action, err)
+		}
+		if exists != c.want {
+			t.Errorf("casbin rule (p, %s, %s, %s) present = %v, want %v",
+				c.role, c.resource, c.action, exists, c.want)
+		}
+	}
+
+	// The v1 seed is fixed at seventeen 'p' rows. The count alone is not the point
+	// (a wrong rule swapped for a right one would keep it), but it cheaply catches
+	// a rule accidentally added to or dropped from a seed that is meant to be fixed.
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM casbin_rules WHERE ptype = 'p'`).Scan(&count); err != nil {
+		t.Fatalf("count casbin 'p' rules: %v", err)
+	}
+	if want := 17; count != want {
+		t.Errorf("casbin 'p' rule count = %d, want %d", count, want)
+	}
+}
+
 // assertSchemaPresent asserts the presence (want=true) or absence (want=false)
-// of the tenants, users, and sessions tables and the opengate_bypass role
-// together, so the round-trip verifies the full surface the migrations create
-// and tear down.
+// of the tenants, users, sessions, and casbin_rules tables and the
+// opengate_bypass role together, so the round-trip verifies the full surface the
+// migrations create and tear down. Including casbin_rules here is what proves the
+// create_casbin_rules Down leaves no table behind after a full DownTo(0).
 func assertSchemaPresent(t *testing.T, db *sql.DB, want bool) {
 	t.Helper()
 	assertTableExists(t, db, "tenants", want)
 	assertTableExists(t, db, "users", want)
 	assertTableExists(t, db, "sessions", want)
+	assertTableExists(t, db, "casbin_rules", want)
 	assertRoleExists(t, db, "opengate_bypass", want)
 }
 
