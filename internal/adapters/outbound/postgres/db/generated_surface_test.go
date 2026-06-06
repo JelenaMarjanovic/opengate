@@ -32,4 +32,5 @@ func TestGeneratedQueriesSurface(t *testing.T) {
 	_ = q.FindSessionByTokenHash
 	_ = q.RefreshSession
 	_ = q.DeleteSession
+	_ = q.ListCasbinPolicyRules
 }
