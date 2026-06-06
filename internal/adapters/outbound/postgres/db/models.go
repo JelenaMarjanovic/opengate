@@ -11,6 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type CasbinRule struct {
+	ID    int32
+	Ptype string
+	V0    *string
+	V1    *string
+	V2    *string
+	V3    *string
+	V4    *string
+	V5    *string
+}
+
 type Session struct {
 	ID           uuid.UUID
 	TenantID     uuid.UUID
