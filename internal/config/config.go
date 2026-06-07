@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 )
@@ -51,6 +52,16 @@ type Config struct {
 	// HTTP, which would break the AC-2/AC-3/AC-4 cookie round-trips. Never set it
 	// false in a real deployment. See the inbound http adapter's cookie.go.
 	CookieSecure bool `envconfig:"COOKIE_SECURE" default:"true"`
+
+	// AuthzRefreshInterval is how often the api subcommand's Casbin authorizer
+	// re-loads the authorization policy from casbin_rules (US-02.04). The policy is
+	// migration-managed and changes rarely, so the 30s default — matching
+	// authz.DefaultRefreshInterval — is ample; it is overridable via the env var for
+	// integration tests (which use a short interval to observe a refresh) or
+	// operational tuning. Like the DSNs and HTTP_ADDR it is read only by the api
+	// subcommand. envconfig parses the duration via time.ParseDuration, so values
+	// like "30s" or "1m" are accepted.
+	AuthzRefreshInterval time.Duration `envconfig:"AUTHZ_REFRESH_INTERVAL" default:"30s"`
 }
 
 // Load reads configuration from the environment. A parse failure returns an

@@ -61,7 +61,10 @@ func TestServeAPIGracefulShutdown(t *testing.T) {
 
 	shutdownCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveAPI(shutdownCtx, logger, srv, ln, pool) }()
+	// Nil authorizer: these lifecycle tests register no authorizer, so serveAPI
+	// skips the authorizer-close step and exercises only the HTTP-drain + pool-close
+	// phases.
+	go func() { done <- serveAPI(shutdownCtx, logger, srv, ln, nil, pool) }()
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	base := "http://" + ln.Addr().String()
@@ -107,6 +110,10 @@ func TestRunAPIBindErrorSurfaces(t *testing.T) {
 		BypassRLSURL: "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
 		DatabaseURL:  "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
 		HTTPAddr:     occupied.Addr().String(),
+		// A positive interval (matching the envconfig 30s default's shape) so the
+		// up-front interval check passes and the bind on the occupied address remains
+		// the failure under test.
+		AuthzRefreshInterval: time.Second,
 	}
 	logger := observability.NewLogger(io.Discard, slog.LevelError)
 
@@ -151,6 +158,31 @@ func TestRunAPIRequiresBypassDSN(t *testing.T) {
 	}
 }
 
+// TestRunAPIRejectsNonPositiveRefreshInterval proves the api subcommand validates
+// AUTHZ_REFRESH_INTERVAL before acquiring any resource: a non-positive interval is
+// meaningless and would panic the refresh loop's time.Ticker on Start, so it must
+// fail fast at config-load. envconfig handles the unparseable case; this covers the
+// parseable-but-non-positive values (0s and negative). Both DSNs are present and
+// syntactically valid, so the only failure reached is the interval check.
+func TestRunAPIRejectsNonPositiveRefreshInterval(t *testing.T) {
+	logger := observability.NewLogger(io.Discard, slog.LevelError)
+	for _, interval := range []time.Duration{0, -1 * time.Second} {
+		cfg := config.Config{
+			BypassRLSURL:         "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
+			DatabaseURL:          "postgres://test:test@127.0.0.1:5432/opengate_test?sslmode=disable",
+			HTTPAddr:             ":0",
+			AuthzRefreshInterval: interval,
+		}
+		err := runAPI(context.Background(), logger, cfg)
+		if err == nil {
+			t.Fatalf("interval %s: expected an error, got nil", interval)
+		}
+		if !strings.Contains(err.Error(), "AUTHZ_REFRESH_INTERVAL must be positive") {
+			t.Errorf("interval %s: error %q does not name the field or the positivity rule", interval, err)
+		}
+	}
+}
+
 // TestAPIServerHealthEndpoints is the end-to-end server-boot + health test
 // against a real (testcontainers) Postgres on the bypass pool. It asserts:
 //   - /livez returns 200 without touching the DB (it still returns 200 after the
@@ -191,7 +223,10 @@ func TestAPIServerHealthEndpoints(t *testing.T) {
 
 	shutdownCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- serveAPI(shutdownCtx, logger, srv, ln, pool) }()
+	// Nil authorizer: these lifecycle tests register no authorizer, so serveAPI
+	// skips the authorizer-close step and exercises only the HTTP-drain + pool-close
+	// phases.
+	go func() { done <- serveAPI(shutdownCtx, logger, srv, ln, nil, pool) }()
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	base := "http://" + ln.Addr().String()
