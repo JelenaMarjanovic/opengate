@@ -1,6 +1,6 @@
 # OpenGate — System Design Document
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Draft for review
 **Document type:** System design (implementation-level patterns, code-level contracts, algorithmic decisions)
 **Author:** Jelena Marjanović
@@ -372,18 +372,21 @@ API key verification on the server side is more expensive than session lookup be
 
 Multi-tenant isolation in OpenGate is enforced by two independent layers, each of which would on its own be sufficient to prevent cross-tenant data exposure under normal conditions, and which together provide defense in depth against bugs in either layer. The two layers are the application layer (which includes the tenant identifier in every query) and the database layer (which enforces Row-Level Security policies). This section specifies how each layer is implemented and how they interact.
 
-**The connection-level tenant binding.** The first piece of the puzzle is that every database operation occurs in the context of a known tenant. The mechanism is a Postgres session variable named `app.current_tenant_id` that is set on every connection checked out of the pool. The pgx connection pool supports an `AfterAcquire` hook that runs before the connection is returned to the caller; OpenGate registers a hook that extracts the tenant identifier from the request context and issues a `SELECT set_config('app.current_tenant_id', $1, false)` statement to set the variable for the duration of the connection's checkout. When the connection is returned to the pool, a `BeforeRelease` hook resets the variable to empty so that the next checkout starts from a clean state.
+**The connection-level tenant binding.** The first piece of the puzzle is that every database operation occurs in the context of a known tenant. The mechanism is a Postgres session variable named `app.current_tenant_id` that is set on every connection checked out of the pool. The pgx connection pool supports a `BeforeAcquire` hook that runs before the connection is returned to the caller; OpenGate registers a hook that extracts the tenant identifier from the request context and issues a `SELECT set_config('app.current_tenant_id', $1, false)` statement to set the variable for the duration of the connection's checkout. If no tenant is in context — a bug on the authenticated path — the hook binds the variable to empty and logs a warning rather than leaving prior state, so the connection is deterministic and, under forced RLS, denies all rows. When the connection is returned to the pool, an `AfterRelease` hook (which takes no request context) resets the variable to empty so that the next checkout starts from a clean state.
 
 ```go
-// configurePool registers AfterAcquire and BeforeRelease hooks that bind
+// configurePool registers BeforeAcquire and AfterRelease hooks that bind
 // the tenant identifier from the request context to the database session
 // variable, and reset it on release.
-func configurePool(config *pgxpool.Config) {
-    config.AfterAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+func configurePool(config *pgxpool.Config, logger *slog.Logger) {
+    config.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
         tenantID, ok := tenant.FromContext(ctx)
         if !ok {
-            // No tenant in context: leave the variable empty, RLS will reject.
-            // This is the safe default; missing tenant context is a bug.
+            // No tenant on the RLS-bound pool is a bug. Bind empty explicitly
+            // so the connection is deterministic whether fresh or recycled,
+            // and warn; under forced RLS this state denies all rows (fail closed).
+            _, _ = conn.Exec(ctx, "SELECT set_config('app.current_tenant_id', '', false)")
+            logger.WarnContext(ctx, "postgres: no tenant in context on RLS-bound pool; bound empty (RLS will deny all rows)")
             return true
         }
         _, err := conn.Exec(ctx,
@@ -392,8 +395,9 @@ func configurePool(config *pgxpool.Config) {
         )
         return err == nil
     }
-    config.BeforeRelease = func(ctx context.Context, conn *pgx.Conn) bool {
-        _, _ = conn.Exec(ctx, "SELECT set_config('app.current_tenant_id', '', false)")
+    // AfterRelease takes no context; the reset runs on a background context.
+    config.AfterRelease = func(conn *pgx.Conn) bool {
+        _, _ = conn.Exec(context.Background(), "SELECT set_config('app.current_tenant_id', '', false)")
         return true
     }
 }
@@ -413,7 +417,7 @@ FROM credentials
 WHERE tenant_id = $1 AND id = $2;
 ```
 
-**The database-layer policy.** The second layer is Postgres Row-Level Security. Every tenant-scoped table has an RLS policy that constrains the rows visible to a connection based on the session variable. The policy is enabled on the table with `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`, and the policy itself is `CREATE POLICY tenant_isolation ON <table> USING (tenant_id = current_setting('app.current_tenant_id')::uuid)`. The FORCE clause is important: by default, RLS does not apply to the table owner, and the application connects to Postgres as the owner of the schema. The FORCE clause makes the policy apply to all roles including the owner, which is what makes the layer effective.
+**The database-layer policy.** The second layer is Postgres Row-Level Security. Every tenant-scoped table has an RLS policy that constrains the rows visible to a connection based on the session variable. The policy is enabled on the table with `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`, and the policy itself is `CREATE POLICY tenant_isolation ON <table> USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid)`. The two-argument `current_setting(..., true)` returns NULL instead of raising when the variable is unset, and `nullif(..., '')` maps the pool's reset-to-empty value to NULL as well, so a connection with no tenant bound sees zero rows rather than an `invalid input syntax for type uuid` error — the fail-closed behavior the bind-empty hook and the verification test depend on. The FORCE clause is important: by default, RLS does not apply to the table owner, and the application connects to Postgres as the owner of the schema. The FORCE clause makes the policy apply to all roles including the owner, which is what makes the layer effective.
 
 If the session variable is empty (no tenant set), the cast to uuid in the policy fails and the policy returns no rows. This is the safe default: a query that runs without a tenant context returns no data rather than returning all data.
 
@@ -431,7 +435,7 @@ The tenant provisioning and identity components are realized as the `TenantManag
 
 Correction (v1.1): the identity aggregates — tenant, user, and session — are state-stored, not event-sourced. Their tables (`tenants`, `users`, `sessions`, and likewise `readers`, `subscriptions`, `casbin_rules`) are authoritative state mutated by ordinary `INSERT` and `UPDATE`, per Database Schema section five, which is authoritative over the event-sourced framing previously written here. Event sourcing applies only to the domain aggregates — members, credentials, policies, doors, and access — and arrives with the event store in Epic E3. Concretely: the tenant management use case exposes creation, configuration-change, and suspension or reactivation operations; the user management use case exposes creation, role-change, password-change, and deactivation; a session row is created at login and thereafter mutated by direct updates of `last_seen_at` and `expires_at`. None of these emit domain events or rebuild from an event stream. Do not build event-sourced tenant or user aggregates.
 
-The Casbin authorizer adapter is initialized at process startup with a model file (`config/rbac_model.conf`) defining the request and policy schemas and a policy adapter that loads the role-permission rules from the `casbin_rules` table in Postgres. The adapter caches the loaded policy in process memory and refreshes it on a thirty-second interval. Policy updates triggered through the user management use case write to the table and also send a refresh signal via Postgres LISTEN/NOTIFY so that other application instances refresh sooner than the polling interval.
+The Casbin authorizer adapter is initialized at process startup with a model file (`config/rbac_model.conf`) defining the request and policy schemas and a policy loader that reads the role-permission rules from the `casbin_rules` table in Postgres on the bypass pool. The adapter caches the loaded policy in process memory and refreshes it on a thirty-second interval. Correction (v1.2): the v1 policy is migration-managed — the rules are seeded by migration per Database Schema section 5.6 and no role holds write access to `casbin_rules`, so there is no user-management or other runtime write path and no LISTEN/NOTIFY refresh signal; refresh is polling-only, for the same reasons section 6's projector polls rather than listens. The cached policy sits behind an atomic pointer that is swapped for a freshly built enforcer on each successful load, retaining the last-good policy if a refresh load fails and swapping to deny-all on a successful zero-row load. A LISTEN/NOTIFY fast-path may be added later if multi-instance refresh latency warrants it.
 
 The bootstrap CLI subcommand uses the BYPASSRLS connection pool described in section ten to create the first tenant and the first owner user in a single transaction. The subcommand reads its inputs from environment variables (`OPENGATE_BOOTSTRAP_TENANT_NAME`, `OPENGATE_BOOTSTRAP_OWNER_EMAIL`, `OPENGATE_BOOTSTRAP_OWNER_PASSWORD`); the operator sets these before invoking the subcommand and unsets them immediately after.
 
@@ -555,7 +559,7 @@ Graceful shutdown is implemented as an ordered sequence of phases triggered by t
 
 Phase one is signal handling. The main function registers a signal handler on `SIGTERM` and `SIGINT` that cancels the application's root context. All subsequent phases are triggered by the root-context cancellation rather than by direct signal handling, which means the shutdown logic is testable without sending real signals.
 
-Phase two is the readiness flip. The health check handler is configured with a shared atomic boolean named `isReady`; on root-context cancellation, the boolean is set to false. The readiness endpoint at `/health/ready` reads the boolean and returns 503 Service Unavailable when it is false. Container orchestrators stop routing new traffic to the container within the readiness probe interval (typically a few seconds in Docker Compose's healthcheck stanza).
+Phase two is the readiness flip. The health check handler is configured with a shared atomic boolean named `isReady`; on root-context cancellation, the boolean is set to false. The readiness endpoint at `/readyz` reads the boolean and returns 503 Service Unavailable when it is false. Container orchestrators stop routing new traffic to the container within the readiness probe interval (typically a few seconds in Docker Compose's healthcheck stanza).
 
 Phase three is the HTTP server shutdown. The chi router is wrapped in a standard `http.Server` whose `Shutdown` method is called with a context that has a thirty-second timeout. The server stops accepting new connections immediately and waits for in-flight requests to complete up to the timeout. The thirty-second timeout is chosen as a multiple of the longest reasonable request duration in the system; queries with longer expected duration (such as the export job initiation, which can take several seconds) must complete within the timeout or be cut short, and the cut-short case logs a warning.
 
@@ -732,7 +736,7 @@ The index below maps every significant concept and decision in this document to 
 
 **Keyset pagination for audit queries.** Primary in section 18.
 
-**LISTEN/NOTIFY for SSE fanout.** Primary in section 15. Also referenced in section 11.
+**LISTEN/NOTIFY for SSE fanout.** Primary in section 15.
 
 **Logging via slog.** Primary in section 8.
 

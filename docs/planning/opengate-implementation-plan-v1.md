@@ -1,6 +1,6 @@
 # OpenGate — Implementation Plan
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Draft for review
 **Document type:** Implementation plan (epics, user stories, sprint plan, risk register)
 **Author:** Jelena Marjanović
@@ -374,6 +374,8 @@ _Technical Notes:_ Session token generation, hashing, and cookie attributes are 
 
 Scope (v1.1): US-02.03 delivers the `sessions` table, the login/logout/refresh use case, and the session middleware only; the connection pool and RLS policies are US-02.05. The two pre-authentication identity lookups — user-by-email at login, and session-by-token on every request — execute on the BYPASSRLS pool, because they must resolve identity across a not-yet-known tenant boundary and because US-02.05 forces RLS on `users` and `sessions` (a context-less query against an RLS-forced table returns zero rows, so a naive lookup would pass in this sprint and then break when US-02.05 lands). Open decision, deferred to this story's articulation: how login resolves the tenant, given that `users.email` is unique per tenant (`UNIQUE (tenant_id, email)`) and the `/api/v1/auth/login` endpoint carries no tenant in its path. Candidate mechanisms: tenant identifier in the request body, host/subdomain resolution, single-tenant-per-deployment, or globally-unique email. The chosen mechanism is recorded in System Design section nine.
 
+Realized (v1.2): US-02.03 as executed also delivered the regular RLS-bound pool and its tenant-binding hooks (`internal/adapters/outbound/postgres/pool.go`, `NewPool`), which the scope note above placed in US-02.05 — the authenticated session path needs that pool, so it landed here, alongside the pre-existing bypass pool. US-02.05 consequently reduced to the RLS migration and the dual-layer verification test.
+
 _INVEST:_ All criteria satisfied.
 
 ---
@@ -419,6 +421,8 @@ _Story Points:_ 5
 _Dependencies:_ US-02.01, US-02.03, US-01.04
 
 _Technical Notes:_ The pool configuration and the dual-layer verification test are specified in System Design section ten; the policy definitions are in Database Schema section thirteen. The dependency on US-02.03 is new in v1.1: this story enables RLS on the `sessions` table, which US-02.03 creates, so US-02.03 must complete first. Both stories sit in Sprint 3, so the dependency is satisfied within the sprint.
+
+Realized (v1.2): the regular pool and hooks landed in US-02.03 (see its realized note) and `opengate_bypass` was created `WITH BYPASSRLS` in the role migration, so US-02.05 as executed reduced to the RLS enable/force migration on `tenants`, `users`, `sessions` and the dual-layer verification test; the role was not touched. The verification test grants `opengate_app` a minimal SELECT on `tenants`/`users` as test-only scaffolding, not in the migration: no production regular-pool reader of those tables exists yet, so a migration grant would be dead privilege until one does, at which point that reader's own migration carries the real grant.
 
 _INVEST:_ All criteria satisfied. The story is larger (5 points) than the INVEST "Small" ideal but is not further divisible without producing two halves neither of which can satisfy an isolation acceptance criterion on its own.
 

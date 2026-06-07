@@ -1,6 +1,6 @@
 # OpenGate — Database Schema Document
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Draft for review
 **Document type:** Concrete schema specification (tables, columns, constraints, indexes, RLS policies, migration structure)
 **Author:** Jelena Marjanović
@@ -973,103 +973,103 @@ The Row-Level Security mechanism enforces multi-tenant isolation at the database
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON tenants
-    USING (id = current_setting('app.current_tenant_id')::uuid);
+    USING (id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON users
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sessions
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE readers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE readers FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON readers
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscriptions FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON subscriptions
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON events
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE command_idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE command_idempotency_keys FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON command_idempotency_keys
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE decision_idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE decision_idempotency_keys FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON decision_idempotency_keys
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE reconciliation_idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reconciliation_idempotency_keys FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON reconciliation_idempotency_keys
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 -- Read models
 ALTER TABLE members_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE members_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON members_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE credentials_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credentials_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON credentials_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE policies_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE policies_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON policies_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE policy_doors_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE policy_doors_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON policy_doors_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE policy_time_windows_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE policy_time_windows_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON policy_time_windows_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE policy_assignments_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE policy_assignments_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON policy_assignments_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE doors_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE doors_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON doors_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE audit_log_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON audit_log_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE subscription_delivery_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscription_delivery_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON subscription_delivery_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE export_status_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE export_status_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON export_status_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 
 ALTER TABLE reader_connectivity_view ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reader_connectivity_view FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON reader_connectivity_view
-    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+    USING (tenant_id = nullif(current_setting('app.current_tenant_id', true), '')::uuid);
 -- +goose StatementEnd
 ```
 
@@ -1084,6 +1084,8 @@ The `projection_progress` table also does _not_ have RLS because projectors oper
 The River-managed tables (created automatically by River on first use) do not have RLS, for the same reason as `projection_progress`. River workers run system-level operations across tenants.
 
 The `WITH CHECK` clause is omitted from these policies because the policies use the same predicate for both read and write operations: a connection that cannot see a row also cannot insert or update one with a `tenant_id` that does not match the session variable. Adding an explicit `WITH CHECK` clause identical to the `USING` clause would have the same effect but add visual noise to the policy definitions.
+
+Note (v1.2): the two-argument `current_setting(..., true)` (missing_ok) returns NULL rather than raising on an unset parameter, and `nullif(..., '')` collapses the pool's reset-to-empty value to NULL as well; `tenant_id = NULL` is not true, so a connection with no tenant bound sees zero rows rather than an `invalid input syntax for type uuid` error. This is the fail-closed behavior US-02.05's acceptance criteria require (a context-less query returns zero rows plus a warning), and it is the form realized for `tenants`, `users`, and `sessions`; the remaining tables adopt it as they are created. The pool's `AfterRelease` hook resets the variable to the empty string, which is why the form must collapse `''` and not only the unset case.
 
 The BYPASSRLS role used by the bootstrap CLI subcommand and by the data export job is created separately and granted to those specific code paths. The role definition lives in a separate migration that runs early in the migration sequence; the migration is shown below.
 
