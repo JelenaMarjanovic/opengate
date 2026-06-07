@@ -48,6 +48,14 @@ type Config struct {
 	// Authenticator is the auth use case backing login/logout/whoami and the
 	// session middleware.
 	Authenticator Authenticator
+	// Authorizer is the policy enforcer backing the per-route authorization
+	// middleware (requirePermission, authz_middleware.go). It is consumed by the
+	// resource routes that land in later epics, where the router builds
+	// `require := requirePermission(cfg.Authorizer)` and guards each route with
+	// `.With(require(resource, action))`. It is nil on the health-only and
+	// auth-only routers (which register no authorization-protected route and so
+	// never invoke it), exactly as Authenticator is nil where unused.
+	Authorizer Authorizer
 	// CookieSecure marks the session cookie Secure and applies the __Host- name
 	// prefix. True in production (HTTPS via Caddy); false only for the plain-HTTP
 	// integration tests. See cookie.go.

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	httpadapter "github.com/JelenaMarjanovic/opengate/internal/adapters/inbound/http"
+	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/authz"
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
 	appauth "github.com/JelenaMarjanovic/opengate/internal/application/auth"
 	"github.com/JelenaMarjanovic/opengate/internal/auth"
@@ -42,6 +43,16 @@ const (
 // Depending on the seam (not the concrete pool) lets the graceful-shutdown test
 // assert the pool is closed with a spy and no live database.
 type poolCloser interface {
+	Close()
+}
+
+// authzCloser is the narrow shutdown capability serveAPI needs from the
+// authorizer: stop the policy-refresh loop and wait for the goroutine to exit.
+// *authz.CasbinAuthorizer satisfies it. It is closed BEFORE the pools because the
+// refresh loop reads the bypass pool; closing it first guarantees no refresh query
+// can race a closed pool. It is nil on the health-only lifecycle tests, which
+// register no authorizer.
+type authzCloser interface {
 	Close()
 }
 
@@ -75,6 +86,18 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	if cfg.DatabaseURL == "" {
 		return errors.New("api: DATABASE_URL is not set")
 	}
+	// Validate the refresh interval here, with the other up-front config checks and
+	// before any pool or listener is acquired: it is a pure config value known at
+	// startup with no I/O, so it belongs with validate-before-acquire. The
+	// authorizer's refresh loop drives a time.Ticker, which panics on a non-positive
+	// duration, so a misconfigured 0s or negative AUTHZ_REFRESH_INTERVAL would crash
+	// on Start; a non-positive interval is meaningless on its own terms regardless.
+	// envconfig already rejects unparseable durations, so this covers only the
+	// parseable-but-non-positive case (0s, negative). It sits after the DSN checks so
+	// a missing-DSN config still trips its DSN error first.
+	if cfg.AuthzRefreshInterval <= 0 {
+		return fmt.Errorf("api: AUTHZ_REFRESH_INTERVAL must be positive, got %s", cfg.AuthzRefreshInterval)
+	}
 
 	bypass, err := postgres.NewBypassPool(ctx, cfg.BypassRLSURL)
 	if err != nil {
@@ -86,6 +109,43 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 
 	regular, err := postgres.NewPool(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
+		bypass.Close()
+		return fmt.Errorf("api: %w", err)
+	}
+
+	// Bind the listener up front — and BEFORE the authorizer's fail-fast policy load
+	// — so a bind failure (e.g. address in use) surfaces immediately and
+	// synchronously, and is reached WITHOUT dialing the database: the authorizer's
+	// initial load is the first thing that touches Postgres, so binding first keeps a
+	// bind error distinct from a policy-load error. The bound address is also exposed
+	// (useful when :0 is used in tests). srv.Serve(ln) — not ListenAndServe —
+	// consumes this listener.
+	ln, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		regular.Close()
+		bypass.Close()
+		return fmt.Errorf("api: listen on %s: %w", cfg.HTTPAddr, err)
+	}
+	// Release the listener on every return path. On the error paths below (e.g. a
+	// failed authz load) this frees the bound port; on the normal path the graceful
+	// Shutdown has already closed it, so this is a harmless redundant close of an
+	// already-closed listener — hence the ignored error. It keeps runAPI's
+	// test-callable error paths from leaking the port; in production the process
+	// exits and the OS reclaims it regardless.
+	defer func() { _ = ln.Close() }()
+
+	// Authorizer (US-02.04): build the Postgres policy loader on the BYPASS pool —
+	// casbin_rules is global and tenant-less, readable only by opengate_bypass — and
+	// construct the Casbin authorizer with the embedded model and the configured
+	// refresh interval. NewCasbinAuthorizer performs a FAIL-FAST initial load: if the
+	// policy cannot be read (for example because migrations have not run and
+	// casbin_rules is missing or unreadable) it errors here and the API does NOT
+	// start — it must never serve without a working policy.
+	policyLoader := postgres.NewCasbinPolicyLoader(bypass, logger)
+	authorizer, err := authz.NewCasbinAuthorizer(policyLoader.Load, authz.ModelText, cfg.AuthzRefreshInterval, logger)
+	if err != nil {
+		// ln is closed by the deferred close above.
+		regular.Close()
 		bypass.Close()
 		return fmt.Errorf("api: %w", err)
 	}
@@ -110,6 +170,7 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	router := httpadapter.NewRouter(httpadapter.Config{
 		Pinger:        bypass,
 		Authenticator: authenticator,
+		Authorizer:    authorizer,
 		CookieSecure:  cfg.CookieSecure,
 	})
 
@@ -121,26 +182,21 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 		IdleTimeout:       apiIdleTimeout,
 	}
 
-	// Bind the listener up front so a bind failure (e.g. address in use) surfaces
-	// immediately and synchronously, rather than after entering the serve
-	// goroutine. It also exposes the resolved address (useful when :0 is used in
-	// tests). srv.Serve(ln) — not ListenAndServe — consumes this listener.
-	ln, err := net.Listen("tcp", cfg.HTTPAddr)
-	if err != nil {
-		regular.Close()
-		bypass.Close()
-		return fmt.Errorf("api: listen on %s: %w", cfg.HTTPAddr, err)
-	}
-
 	// signal.NotifyContext cancels the returned context on SIGTERM/SIGINT. All
 	// shutdown phases hang off this cancellation, which keeps the shutdown logic
 	// testable without sending real signals (System Design §21, phase one).
 	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start the policy-refresh loop on the serving lifecycle context: it runs for as
+	// long as the server is meant to serve, stopping when signalCtx is canceled and,
+	// deterministically, when serveAPI calls Close during the shutdown sequence.
+	authorizer.Start(signalCtx)
+
 	logger.InfoContext(ctx, "api: http server listening", slog.String("addr", ln.Addr().String()))
-	// Close order at shutdown: regular (request) pool first, then bypass.
-	return serveAPI(signalCtx, logger, srv, ln, regular, bypass)
+	// Shutdown close order: authorizer first (its refresh loop reads the bypass
+	// pool), then the regular (request) pool, then bypass.
+	return serveAPI(signalCtx, logger, srv, ln, authorizer, regular, bypass)
 }
 
 // serveAPI runs srv on ln until shutdownCtx is canceled (in production, by a
@@ -151,14 +207,23 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 //
 // pools is variadic so the api command can pass BOTH the regular and the bypass
 // pool while the lifecycle tests pass a single spy poolCloser. Each is closed
-// exactly once, in argument order, as the final phase.
+// exactly once, in argument order, as the final phase. The authorizer (when
+// present) is closed first, ahead of the pools, because its refresh loop reads the
+// bypass pool; the health-only lifecycle tests pass a nil authorizer.
 //
 // It is split from runAPI so a test can drive shutdown by canceling shutdownCtx
 // and inject a spy poolCloser. shutdownCtx is the cancellation trigger, not a
 // deadline; the drain deadline is a fresh background-derived context so it is not
 // already-canceled when shutdown begins.
-func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server, ln net.Listener, pools ...poolCloser) error {
+func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server, ln net.Listener, authorizer authzCloser, pools ...poolCloser) error {
 	closeAll := func() {
+		// Stop the authorizer's refresh loop (and wait for the goroutine to exit)
+		// BEFORE closing the pools: the loop reads the bypass pool, so closing it
+		// first means no refresh query can race a closed pool. Nil on the health-only
+		// lifecycle tests, which register no authorizer.
+		if authorizer != nil {
+			authorizer.Close()
+		}
 		for _, p := range pools {
 			p.Close()
 		}
@@ -207,6 +272,10 @@ func serveAPI(shutdownCtx context.Context, logger *slog.Logger, srv *http.Server
 	return nil
 }
 
-// Compile-time assertion that the concrete pool satisfies the shutdown seam, so
-// a signature drift in pgxpool is caught at build time, not in the test.
-var _ poolCloser = (*pgxpool.Pool)(nil)
+// Compile-time assertions that the concrete pool and authorizer satisfy their
+// shutdown seams, so a signature drift in pgxpool or the authorizer is caught at
+// build time, not in the test.
+var (
+	_ poolCloser  = (*pgxpool.Pool)(nil)
+	_ authzCloser = (*authz.CasbinAuthorizer)(nil)
+)

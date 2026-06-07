@@ -143,6 +143,17 @@ var problemTable = []struct {
 		status:   http.StatusForbidden,
 		detail:   "This tenant is suspended. Contact your administrator.",
 	}},
+	// The 403 detail is deliberately GENERIC — it names neither the resource nor the
+	// action that was denied. The body comes from this static row, never from
+	// per-request data, both to honor the static-mapping rule and so a denial does
+	// not disclose the authorization model to the caller (the authz middleware raises
+	// apperr.ErrForbidden carrying no per-request specifics).
+	{apperr.ErrForbidden, problemMapping{
+		typeSlug: "forbidden",
+		title:    "Forbidden",
+		status:   http.StatusForbidden,
+		detail:   "You do not have permission to perform this action.",
+	}},
 	{errNotReady, problemMapping{
 		typeSlug: "service-unavailable",
 		title:    "Service unavailable",
