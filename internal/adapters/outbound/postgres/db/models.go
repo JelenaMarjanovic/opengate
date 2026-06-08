@@ -22,6 +22,26 @@ type CasbinRule struct {
 	V5    *string
 }
 
+type Event struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	AggregateID    uuid.UUID
+	AggregateType  string
+	Sequence       int64
+	StreamPosition int64
+	EventType      string
+	Payload        []byte
+	Metadata       []byte
+	OccurredAt     pgtype.Timestamptz
+}
+
+type ProjectionProgress struct {
+	ProjectorName string
+	LastPosition  int64
+	LastEventAt   pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+}
+
 type Session struct {
 	ID           uuid.UUID
 	TenantID     uuid.UUID

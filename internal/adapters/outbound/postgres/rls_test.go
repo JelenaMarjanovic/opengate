@@ -157,11 +157,21 @@ func TestRLSTenantIsolation(t *testing.T) {
 	})
 }
 
+// beforeTenantRLSVersion is the goose version (timestamp prefix) of
+// grant_casbin_rules_select, the migration directly beneath
+// enable_rls_tenant_isolation (20260607093000). Rolling DownTo this version
+// reverts the identity RLS migration regardless of how many later migrations
+// (US-03.01's event store and beyond) sit above it.
+const beforeTenantRLSVersion int64 = 20260607090000
+
 // TestRLSMigrationRollback is AC5: after every migration is applied, rolling back
-// one step (the RLS migration, which is the most recent) must drop the
-// tenant_isolation policy from all three tables. It is deliberately separate from
-// the AC1–AC4 assertions, which require RLS enabled throughout. The structure
-// mirrors TestMigrationsRoundTrip: a superuser sql.DB driving the goose provider.
+// through enable_rls_tenant_isolation must drop the tenant_isolation policy from
+// all three identity tables. Originally a single one-step Down — valid while that
+// migration was the most recent — it now rolls DownTo the version directly beneath
+// it (beforeTenantRLSVersion) because US-03.01 stacked the event-store migrations
+// on top. It is deliberately separate from the AC1–AC4 assertions, which require
+// RLS enabled throughout. The structure mirrors TestMigrationsRoundTrip: a
+// superuser sql.DB driving the goose provider.
 func TestRLSMigrationRollback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping container-backed test in short mode")
@@ -188,7 +198,8 @@ func TestRLSMigrationRollback(t *testing.T) {
 		t.Fatalf("new provider: %v", err)
 	}
 
-	// Apply every migration; the RLS migration is the most recent, so it sits on top.
+	// Apply every migration; enable_rls_tenant_isolation creates the policy on the
+	// three identity tables.
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("up: %v", err)
 	}
@@ -199,16 +210,18 @@ func TestRLSMigrationRollback(t *testing.T) {
 	}
 	t.Log("AC5: RLS migration applied -> tenant_isolation present on tenants, users, sessions")
 
-	// Roll back exactly one step. goose Down reverts only the most-recently applied
-	// migration — here the RLS one — leaving every earlier migration in place.
-	if _, err := provider.Down(ctx); err != nil {
-		t.Fatalf("down one step: %v", err)
+	// Roll back everything down to (but keeping) the migration directly beneath
+	// enable_rls_tenant_isolation, so that migration's Down runs and drops the three
+	// policies. DownTo — not a blind one-step Down — because US-03.01's event-store
+	// migrations now sit on top; the target version is independent of how many.
+	if _, err := provider.DownTo(ctx, beforeTenantRLSVersion); err != nil {
+		t.Fatalf("down to %d: %v", beforeTenantRLSVersion, err)
 	}
 	// AC5: pg_policies shows no tenant_isolation on any of the three tables.
 	for _, table := range []string{"tenants", "users", "sessions"} {
 		assertTenantIsolationPolicy(t, db, table, false)
 	}
-	t.Log("AC5: rolled back one step -> tenant_isolation absent on tenants, users, sessions")
+	t.Log("AC5: rolled back through enable_rls_tenant_isolation -> tenant_isolation absent on tenants, users, sessions")
 }
 
 // grantAppSelect is test-only scaffolding. opengate_app holds NO grant on
