@@ -466,7 +466,7 @@ _Acceptance Criteria:_
 
 _Story Points:_ 2
 
-_Dependencies:_ US-02.06
+_Dependencies:_ US-02.05
 
 _Technical Notes:_ The migration includes the `events_stream_position_idx`, `events_tenant_occurred_at_idx`, and `events_tenant_type_occurred_at_idx` indexes from Database Schema section 6.1.
 
@@ -618,7 +618,7 @@ _Acceptance Criteria:_
 
 _Story Points:_ 5
 
-_Dependencies:_ US-03.03, US-02.06
+_Dependencies:_ US-03.03, US-02.05
 
 _Technical Notes:_ Member aggregate invariants are in System Design section twelve. The members_view synchronous projection is specified in System Design section three.
 
