@@ -13,7 +13,7 @@ type Event struct {
 	ID             uuid.UUID       `json:"id"`              // UUIDv7, time-ordered
 	AggregateID    uuid.UUID       `json:"aggregate_id"`    // the aggregate this event belongs to
 	AggregateType  string          `json:"aggregate_type"`  // e.g. "member", "credential", "access"
-	Sequence       int64           `json:"sequence"`        // 1-based, monotonic within aggregate; caller-set
+	Sequence       int64           `json:"sequence"`        // 1-based, monotonic within aggregate; assigned by Append from expectedSequence, populated on read (parallel to StreamPosition)
 	StreamPosition int64           `json:"stream_position"` // global ordering; assigned by the store on append, zero on Append input
 	TenantID       uuid.UUID       `json:"tenant_id"`       // denormalized; caller-set, verified by the events RLS WITH CHECK
 	OccurredAt     time.Time       `json:"occurred_at"`     // event timestamp, UTC
