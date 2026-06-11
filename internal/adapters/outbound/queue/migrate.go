@@ -40,6 +40,23 @@ var riverGrants = []string{
 	// `RETURNING` the inserted row, and Postgres needs SELECT on a column to
 	// return it (the same reason the events grant pairs SELECT with INSERT).
 	`GRANT SELECT, INSERT ON river.river_job TO opengate_app`,
+	// Column-level UPDATE on river_job.kind. River's InsertTx (the fast insert
+	// path, JobInsertFastMany) is an upsert -- `INSERT ... ON CONFLICT (unique_key)
+	// DO UPDATE SET kind = EXCLUDED.kind` -- and Postgres requires UPDATE privilege
+	// for any statement that CONTAINS a DO UPDATE action, checked statically at
+	// plan time even when no conflict can occur (our jobs carry a NULL unique_key,
+	// so the arbiter never fires, yet the privilege is still demanded). Without
+	// this, every enqueue fails with "permission denied for table river_job"
+	// (42501) -- verified empirically; Step 1's grant set missed it.
+	//
+	// The grant is scoped to the single column the upsert writes (kind), NOT the
+	// whole table, so it stays least-privilege: has_table_privilege(.,'UPDATE')
+	// remains false (the negative assertion below still holds), and opengate_app
+	// still cannot UPDATE state/attempt/etc. -- the worker (opengate_bypass) keeps
+	// exclusive ownership of the job lifecycle. If a future River version's DO
+	// UPDATE writes more columns, enqueue will fail the same visible way and this
+	// column list is where it gets widened.
+	`GRANT UPDATE (kind) ON river.river_job TO opengate_app`,
 	// river_job.id is bigserial, so an INSERT that omits id calls nextval() on
 	// river_job_id_seq, which requires USAGE on that sequence. The named sequence
 	// is the bigserial-derived <table>_<column>_seq; granting it (rather than ALL

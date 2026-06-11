@@ -35,6 +35,13 @@ func main() {
 	logger := observability.NewLogger(os.Stdout, cfg.LogLevel)
 	slog.SetDefault(logger)
 
+	// Install the global W3C trace-context propagator once at startup. It defines
+	// how trace context serializes into and out of carriers — e.g. River job
+	// metadata on enqueue (US-03.04) — so the worker can continue the trace.
+	// Without it the global propagator is a no-op that drops context. This is the
+	// OTel API only; span production/export (the SDK) is wired separately.
+	observability.SetGlobalTracePropagator()
+
 	ctx := context.Background()
 	name := os.Args[1]
 	logger.InfoContext(ctx, "opengate starting", slog.String("subcommand", name))

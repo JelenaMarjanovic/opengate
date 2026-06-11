@@ -66,7 +66,15 @@ func TestRiverMigrationSequence(t *testing.T) {
 	assertTablePrivilege(t, db, "opengate_app", "river.river_job", "SELECT", true)
 	// bigserial id => nextval() on the sequence requires USAGE.
 	assertSequencePrivilege(t, db, "opengate_app", "river.river_job_id_seq", "USAGE", true)
-	// The command path must NOT be able to mutate or delete jobs; that is worker
+	// Column-level UPDATE on kind ONLY. River's InsertTx is an upsert
+	// (INSERT ... ON CONFLICT DO UPDATE SET kind), which Postgres gates behind
+	// UPDATE privilege; the grant is scoped to the single column the upsert writes
+	// so the command path can enqueue but cannot alter a job's state. state is the
+	// control field the worker owns, so it must stay un-updatable here.
+	assertColumnPrivilege(t, db, "opengate_app", "river.river_job", "kind", "UPDATE", true)
+	assertColumnPrivilege(t, db, "opengate_app", "river.river_job", "state", "UPDATE", false)
+	// The command path must NOT hold TABLE-level UPDATE (the column grant above
+	// keeps has_table_privilege false) and must not DELETE jobs; that is worker
 	// territory (opengate_bypass). Proves the app grant stayed minimal.
 	assertTablePrivilege(t, db, "opengate_app", "river.river_job", "UPDATE", false)
 	assertTablePrivilege(t, db, "opengate_app", "river.river_job", "DELETE", false)
@@ -254,6 +262,24 @@ func assertSchemaPrivilege(t *testing.T, db *sql.DB, role, schema, priv string, 
 	}
 	if has != want {
 		t.Errorf("has_schema_privilege(%s, %s, %s) = %v, want %v", role, schema, priv, has, want)
+	}
+}
+
+// assertColumnPrivilege checks has_column_privilege(role, table, column, priv)
+// == want. Used to prove the column-scoped UPDATE on river_job.kind: the upsert
+// in River's InsertTx needs UPDATE on the column it writes, but table-level
+// UPDATE stays absent (see the assertTablePrivilege UPDATE=false check). The
+// role/table/column/priv are static in-test constants.
+func assertColumnPrivilege(t *testing.T, db *sql.DB, role, table, column, priv string, want bool) {
+	t.Helper()
+	var has bool
+	if err := db.QueryRow(
+		`SELECT has_column_privilege($1, $2, $3, $4)`, role, table, column, priv,
+	).Scan(&has); err != nil {
+		t.Fatalf("has_column_privilege(%s, %s, %s, %s): %v", role, table, column, priv, err)
+	}
+	if has != want {
+		t.Errorf("has_column_privilege(%s, %s, %s, %s) = %v, want %v", role, table, column, priv, has, want)
 	}
 }
 
