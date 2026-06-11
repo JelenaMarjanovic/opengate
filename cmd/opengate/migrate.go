@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
+	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/queue"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/pressly/goose/v3"
 )
@@ -71,7 +73,40 @@ func runMigrate(ctx context.Context, logger *slog.Logger, args []string) error {
 		return fmt.Errorf("migrate: ping database: %w", err)
 	}
 
-	return dispatchMigrate(ctx, db, action)
+	// Phase 1: goose -- the application schema and its grants. Unchanged.
+	if err := dispatchMigrate(ctx, db, action); err != nil {
+		return err
+	}
+
+	// River phase (R1 phases 2-4) runs only on `up`: it brings the dedicated
+	// `river` schema to the same state goose just brought the app schema to.
+	// down/status/version stay goose-only in Step 1 -- River teardown and status
+	// are not in this step's scope.
+	if action == "up" {
+		if err := riverPhase(ctx, logger, dsn); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// riverPhase runs the River-schema migration phase (CREATE SCHEMA, rivermigrate
+// up, grants) over a pgx pool built from the migration DSN. rivermigrate needs a
+// pgxpool.Pool (the goose path uses a database/sql handle, which River's pgx
+// driver cannot use), so the pool is opened here, scoped to this phase, and
+// closed before returning.
+func riverPhase(ctx context.Context, logger *slog.Logger, dsn string) error {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("migrate: open river pool: %w", err)
+	}
+	defer pool.Close()
+
+	if err := queue.MigrateRiver(ctx, pool, logger); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
 }
 
 // dispatchMigrate constructs a goose Provider over the embedded
