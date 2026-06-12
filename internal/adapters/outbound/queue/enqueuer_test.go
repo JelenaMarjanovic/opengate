@@ -218,7 +218,7 @@ func setupEnqueue(ctx context.Context, t *testing.T) *enqueueEnv {
 
 	// Step 1's insert-only RoleAPI client, built over the app pool's driver. Its
 	// own pool is nominal — InsertTx runs on the tx passed per call.
-	client, err := newRiverClient(RoleAPI, appPool, logger)
+	client, err := newRiverClient(RoleAPI, appPool, logger, nil)
 	if err != nil {
 		t.Fatalf("newRiverClient(RoleAPI): %v", err)
 	}

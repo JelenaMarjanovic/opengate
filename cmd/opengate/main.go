@@ -1,8 +1,8 @@
 // Command opengate is the OpenGate access-control SaaS executable.
 //
 // The binary exposes operational modes through subcommands. Currently
-// "migrate", "bootstrap", and "api" are implemented; worker and simulator
-// arrive in later epics. Running without a subcommand is a usage error.
+// "migrate", "bootstrap", "api", and "worker" are implemented; simulator
+// arrives in a later epic. Running without a subcommand is a usage error.
 package main
 
 import (
@@ -59,6 +59,11 @@ func main() {
 		}
 	case "api":
 		if err := runAPI(ctx, logger, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "opengate:", err)
+			os.Exit(1)
+		}
+	case "worker":
+		if err := runWorker(ctx, logger, cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "opengate:", err)
 			os.Exit(1)
 		}
