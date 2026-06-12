@@ -77,19 +77,19 @@ func NewWorkerPool(pool *pgxpool.Pool, logger *slog.Logger) (*WorkerPool, error)
 // goroutines are running (it does not block). ctx is the run context; the pool
 // runs until Stop is called. The `worker` subcommand passes a NON-signal context
 // here so that shutdown is driven explicitly through Stop (decision A3) rather
-// than by cancelling this context, which would hand River the escalation timing.
+// than by canceling this context, which would hand River the escalation timing.
 func (w *WorkerPool) Start(ctx context.Context) error {
 	return w.client.Start(ctx)
 }
 
 // Stop performs the decision-A3 graceful drain. It is called once the shutdown
 // signal has arrived, so it derives its deadlines from a fresh background context
-// (the signal context is already cancelled by then, exactly as serveAPI does for
+// (the signal context is already canceled by then, exactly as serveAPI does for
 // the HTTP drain).
 //
 //	Stop(ctx)           -- graceful: stop accepting new jobs, wait for in-flight
 //	                       ones. With SoftStopTimeout set, River escalates to
-//	                       cancelling stuck jobs' contexts internally after the
+//	                       canceling stuck jobs' contexts internally after the
 //	                       soft timeout.
 //	StopAndCancel(ctx)  -- hard fallback: only if the graceful drain overruns the
 //	                       full grace budget (a job ignoring cancellation), cancel
@@ -114,7 +114,7 @@ func drainWorkerClient(logger *slog.Logger, client *river.Client[pgx.Tx]) {
 	case errors.Is(err, context.DeadlineExceeded):
 		// The graceful drain (including River's internal soft->hard escalation)
 		// could not finish within the grace budget. Escalate explicitly.
-		logger.Warn("worker: graceful stop exceeded deadline; cancelling in-flight jobs",
+		logger.Warn("worker: graceful stop exceeded deadline; canceling in-flight jobs",
 			slog.Duration("timeout", workerDrainTimeout))
 		hardCtx, hardCancel := context.WithTimeout(context.Background(), workerHardStopTimeout)
 		defer hardCancel()

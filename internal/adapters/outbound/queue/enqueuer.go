@@ -71,7 +71,7 @@ func (e *JobEnqueuer) Enqueue(ctx context.Context, job river.JobArgs) error {
 
 	// 2. Wrap the carrier under the agreed key and marshal it to the metadata
 	//    blob. The key comes from metadataTraceKey so the insert and the Step 3
-	//    extract share one source of truth. Marshalling a map of strings cannot
+	//    extract share one source of truth. Marshaling a map of strings cannot
 	//    realistically fail, but the error is surfaced via the sentinel rather
 	//    than ignored.
 	meta, err := json.Marshal(map[string]propagation.MapCarrier{metadataTraceKey: carrier})
