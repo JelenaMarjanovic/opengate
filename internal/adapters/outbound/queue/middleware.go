@@ -52,7 +52,7 @@ var _ rivertype.WorkerMiddleware = (*traceMiddleware)(nil)
 
 // Work is the WorkerMiddleware hook. It MUST call doInner(ctx) — returning before
 // it would silently drop the job's actual work — and returns doInner's error so
-// River's retry/discard machinery sees the real outcome. The only behaviour added
+// River's retry/discard machinery sees the real outcome. The only behavior added
 // here is trace continuation and error recording on the span.
 func (m *traceMiddleware) Work(ctx context.Context, job *rivertype.JobRow, doInner func(context.Context) error) error {
 	// 1. Rebuild the parent context from the persisted carrier, when present.

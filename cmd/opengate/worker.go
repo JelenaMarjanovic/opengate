@@ -57,7 +57,7 @@ func runWorker(ctx context.Context, logger *slog.Logger, cfg config.Config) erro
 	return serveWorker(ctx, signalCtx, logger, pool, bypass)
 }
 
-// serveWorker starts the pool and blocks until shutdownCtx is cancelled (in
+// serveWorker starts the pool and blocks until shutdownCtx is canceled (in
 // production, by a signal), then runs the graceful drain (decision A3, inside
 // WorkerPool.Stop) and closes the pools as the final phase.
 //
