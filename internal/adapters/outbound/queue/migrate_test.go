@@ -296,3 +296,189 @@ func assertSequencePrivilege(t *testing.T, db *sql.DB, role, seq, priv string, w
 		t.Errorf("has_sequence_privilege(%s, %s, %s) = %v, want %v", role, seq, priv, has, want)
 	}
 }
+
+// TestTeardownRiverRoundTrip runs the full up sequence, asserts the river schema
+// and tables exist, tears River down, and asserts the schema is gone -- the
+// reverse of TestRiverMigrationSequence (decision D2 test 1).
+func TestTeardownRiverRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+
+	ctx := context.Background()
+	container := testsupport.StartPostgres(ctx, t)
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	runFullSequence(ctx, t, dsn)
+
+	db := openSQL(ctx, t, dsn)
+	if !schemaExists(t, db, "river") {
+		t.Fatal("river schema absent after full up")
+	}
+	assertTableSet(t, riverTables(t, db), wantRiverTables)
+
+	teardownRiver(ctx, t, dsn)
+
+	if schemaExists(t, db, "river") {
+		t.Fatal("river schema still present after TeardownRiver")
+	}
+}
+
+// TestTeardownRiverIdempotent tears River down twice; the second run -- against an
+// already-absent schema -- must be a clean no-op (decision D2 test 2): down-all on
+// nothing does nothing (River resolves river_migration via to_regclass, which
+// reports "absent" rather than erroring), and DROP SCHEMA IF EXISTS tolerates the
+// missing schema.
+func TestTeardownRiverIdempotent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+
+	ctx := context.Background()
+	container := testsupport.StartPostgres(ctx, t)
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	runFullSequence(ctx, t, dsn)
+	teardownRiver(ctx, t, dsn) // first run: the real teardown.
+	teardownRiver(ctx, t, dsn) // second run: must not error against an absent schema.
+
+	db := openSQL(ctx, t, dsn)
+	if schemaExists(t, db, "river") {
+		t.Fatal("river schema present after idempotent teardown")
+	}
+}
+
+// TestRiverUpDownUp runs up -> teardown -> up and re-asserts the Step 1 grants, to
+// prove the schema, tables, and privileges are recreated cleanly after a teardown
+// (decision D2 test 3).
+func TestRiverUpDownUp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+
+	ctx := context.Background()
+	container := testsupport.StartPostgres(ctx, t)
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	runFullSequence(ctx, t, dsn)
+	teardownRiver(ctx, t, dsn)
+	runFullSequence(ctx, t, dsn) // up again over a torn-down River.
+
+	db := openSQL(ctx, t, dsn)
+	if !schemaExists(t, db, "river") {
+		t.Fatal("river schema absent after up -> down -> up")
+	}
+	assertTableSet(t, riverTables(t, db), wantRiverTables)
+
+	// Step 1 grants recreated cleanly (decision R2): the command path (opengate_app)
+	// regains its scoped privileges and the worker (opengate_bypass) its full DML.
+	assertSchemaPrivilege(t, db, "opengate_app", "river", "USAGE", true)
+	assertTablePrivilege(t, db, "opengate_app", "river.river_job", "INSERT", true)
+	assertColumnPrivilege(t, db, "opengate_app", "river.river_job", "kind", "UPDATE", true)
+	assertTablePrivilege(t, db, "opengate_app", "river.river_job", "UPDATE", false)
+	assertSequencePrivilege(t, db, "opengate_app", "river.river_job_id_seq", "USAGE", true)
+	assertSchemaPrivilege(t, db, "opengate_bypass", "river", "USAGE", true)
+	for _, priv := range []string{"SELECT", "INSERT", "UPDATE", "DELETE"} {
+		assertTablePrivilege(t, db, "opengate_bypass", "river.river_job", priv, true)
+	}
+}
+
+// TestRiverStatusReporting checks queue.RiverStatus across the three states the
+// status/version actions report (decision D1 test 5): absent before any migration,
+// fully applied after up, and absent again after teardown -- never erroring on an
+// absent schema.
+func TestRiverStatusReporting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+
+	ctx := context.Background()
+	container := testsupport.StartPostgres(ctx, t)
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Before any migration: River is absent, reported cleanly (no error). The total
+	// is still known because AllVersions reads the embedded migration set.
+	before, err := queue.RiverStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("RiverStatus (absent): %v", err)
+	}
+	if before.SchemaPresent {
+		t.Error("RiverStatus reports schema present before any migration")
+	}
+	if before.AppliedVersion != 0 || before.AppliedCount != 0 {
+		t.Errorf("RiverStatus before up: version=%d applied=%d, want 0/0",
+			before.AppliedVersion, before.AppliedCount)
+	}
+	if before.TotalCount == 0 {
+		t.Error("RiverStatus TotalCount is 0; expected River to ship migrations")
+	}
+
+	// After a full up: every migration applied, no pending, version = highest.
+	runFullSequence(ctx, t, dsn)
+	after, err := queue.RiverStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("RiverStatus (applied): %v", err)
+	}
+	if !after.SchemaPresent {
+		t.Fatal("RiverStatus reports schema absent after full up")
+	}
+	if after.AppliedCount != after.TotalCount {
+		t.Errorf("RiverStatus after up: applied=%d total=%d, want all applied",
+			after.AppliedCount, after.TotalCount)
+	}
+	if len(after.Pending) != 0 {
+		t.Errorf("RiverStatus after up: pending=%v, want none", after.Pending)
+	}
+	// River's migrations are versioned 1..N contiguously, so the highest applied
+	// version equals the count once everything is applied.
+	if after.AppliedVersion != after.TotalCount {
+		t.Errorf("RiverStatus after up: version=%d, want %d", after.AppliedVersion, after.TotalCount)
+	}
+
+	// After teardown: absent again, version back to 0 -- and still no error.
+	teardownRiver(ctx, t, dsn)
+	final, err := queue.RiverStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("RiverStatus (after teardown): %v", err)
+	}
+	if final.SchemaPresent {
+		t.Error("RiverStatus reports schema present after teardown")
+	}
+	if final.AppliedVersion != 0 {
+		t.Errorf("RiverStatus after teardown: version=%d, want 0", final.AppliedVersion)
+	}
+}
+
+// teardownRiver runs queue.TeardownRiver over a scoped pool, mirroring the River
+// teardown the migrate subcommand performs once goose reaches version 0.
+func teardownRiver(ctx context.Context, t *testing.T, dsn string) {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open river pool: %v", err)
+	}
+	defer pool.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := queue.TeardownRiver(ctx, pool, logger); err != nil {
+		t.Fatalf("TeardownRiver: %v", err)
+	}
+}
