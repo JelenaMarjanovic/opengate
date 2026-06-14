@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/JelenaMarjanovic/opengate/internal/adapters/outbound/postgres"
@@ -73,93 +75,172 @@ func runMigrate(ctx context.Context, logger *slog.Logger, args []string) error {
 		return fmt.Errorf("migrate: ping database: %w", err)
 	}
 
-	// Phase 1: goose -- the application schema and its grants. Unchanged.
-	if err := dispatchMigrate(ctx, db, action); err != nil {
+	// Phase 1: goose -- the application schema and its grants. gooseVersion is the
+	// resulting DB version, used below to gate the River teardown on `down`.
+	gooseVersion, err := dispatchMigrate(ctx, db, action)
+	if err != nil {
 		return err
 	}
 
-	// River phase (R1 phases 2-4) runs only on `up`: it brings the dedicated
-	// `river` schema to the same state goose just brought the app schema to.
-	// down/status/version stay goose-only in Step 1 -- River teardown and status
-	// are not in this step's scope.
-	if action == "up" {
-		if err := riverPhase(ctx, logger, dsn); err != nil {
-			return err
+	// River phase: River mirrors goose per action over a pgx pool (decisions D1,
+	// D2). The pool is opened per action because rivermigrate cannot use the
+	// database/sql handle the goose phase uses.
+	switch action {
+	case "up":
+		// Bring the river schema up to the state goose just brought the app schema.
+		return withRiverPool(ctx, dsn, func(pool *pgxpool.Pool) error {
+			return queue.MigrateRiver(ctx, pool, logger)
+		})
+	case "down":
+		// D2: tear River down ONLY when the app schema reached version 0. goose
+		// `down` rolls back a single migration, so a non-zero post-down version is
+		// a partial teardown and must leave River intact.
+		if gooseVersion != 0 {
+			return nil
 		}
+		return withRiverPool(ctx, dsn, func(pool *pgxpool.Pool) error {
+			return queue.TeardownRiver(ctx, pool, logger)
+		})
+	case "status":
+		return withRiverPool(ctx, dsn, func(pool *pgxpool.Pool) error {
+			return printRiverStatus(ctx, pool)
+		})
+	case "version":
+		return withRiverPool(ctx, dsn, func(pool *pgxpool.Pool) error {
+			return printRiverVersion(ctx, pool)
+		})
 	}
 
 	return nil
 }
 
-// riverPhase runs the River-schema migration phase (CREATE SCHEMA, rivermigrate
-// up, grants) over a pgx pool built from the migration DSN. rivermigrate needs a
-// pgxpool.Pool (the goose path uses a database/sql handle, which River's pgx
-// driver cannot use), so the pool is opened here, scoped to this phase, and
-// closed before returning.
-func riverPhase(ctx context.Context, logger *slog.Logger, dsn string) error {
+// withRiverPool opens a pgx pool from the migration DSN (the goose phase uses a
+// database/sql handle, which rivermigrate cannot consume), runs fn against it, and
+// closes the pool. fn's error is wrapped to match the subcommand's other failures.
+func withRiverPool(ctx context.Context, dsn string, fn func(*pgxpool.Pool) error) error {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("migrate: open river pool: %w", err)
 	}
 	defer pool.Close()
 
-	if err := queue.MigrateRiver(ctx, pool, logger); err != nil {
+	if err := fn(pool); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	return nil
 }
 
-// dispatchMigrate constructs a goose Provider over the embedded
-// migrations and runs the requested action. The Provider API is used
-// (rather than goose's global functions) so that no process-global state
-// is mutated; this keeps the function safe to call from tests in parallel.
-func dispatchMigrate(ctx context.Context, db *sql.DB, action string) error {
-	// fs.Sub narrows the embedded FS to the migrations subdirectory so
-	// the Provider sees the .sql files at the root of the FS it is given.
-	sub, err := fs.Sub(postgres.Migrations, "migrations")
+// printRiverStatus reports River's migration state after the goose status, in a
+// clearly labeled section (decision D1). An absent `river` schema is reported as
+// such, not as an error.
+func printRiverStatus(ctx context.Context, pool *pgxpool.Pool) error {
+	st, err := queue.RiverStatus(ctx, pool)
 	if err != nil {
-		return fmt.Errorf("migrate: sub filesystem: %w", err)
+		return err
 	}
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, sub)
+	fmt.Println("river:")
+	switch {
+	case !st.SchemaPresent:
+		fmt.Printf("not present (0/%d migrations applied)\n", st.TotalCount)
+	case len(st.Pending) > 0:
+		fmt.Printf("%d/%d migrations applied; pending: %s\n",
+			st.AppliedCount, st.TotalCount, joinVersions(st.Pending))
+	default:
+		fmt.Printf("%d/%d migrations applied\n", st.AppliedCount, st.TotalCount)
+	}
+	return nil
+}
+
+// printRiverVersion reports River's current migration version after the goose
+// version (decision D1). It is 0 when River is absent.
+func printRiverVersion(ctx context.Context, pool *pgxpool.Pool) error {
+	st, err := queue.RiverStatus(ctx, pool)
 	if err != nil {
-		return fmt.Errorf("migrate: new provider: %w", err)
+		return err
+	}
+	fmt.Printf("river version: %d\n", st.AppliedVersion)
+	return nil
+}
+
+// joinVersions renders migration versions as a comma-separated list, e.g. "5, 6".
+func joinVersions(versions []int) string {
+	parts := make([]string, len(versions))
+	for i, v := range versions {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// dispatchMigrate constructs a goose Provider over the embedded migrations and
+// runs the requested action, printing goose's output under a clear engine label
+// (decision D1). It returns the resulting goose DB version for `down` (used by the
+// caller to gate the River teardown on version 0, decision D2); the other actions
+// return 0, which they do not need. The Provider API is used (rather than goose's
+// global functions) so no process-global state is mutated, keeping the function
+// safe to call from tests in parallel.
+func dispatchMigrate(ctx context.Context, db *sql.DB, action string) (int64, error) {
+	provider, err := newGooseProvider(db)
+	if err != nil {
+		return 0, err
 	}
 
 	switch action {
 	case "up":
 		results, err := provider.Up(ctx)
 		if err != nil {
-			return fmt.Errorf("migrate up: %w", err)
+			return 0, fmt.Errorf("migrate up: %w", err)
 		}
 		for _, r := range results {
 			fmt.Printf("OK  %s (%s)\n", r.Source.Path, r.Duration)
 		}
-		return nil
+		return 0, nil
 	case "down":
 		result, err := provider.Down(ctx)
 		if err != nil {
-			return fmt.Errorf("migrate down: %w", err)
+			return 0, fmt.Errorf("migrate down: %w", err)
 		}
 		fmt.Printf("OK  rolled back %s\n", result.Source.Path)
-		return nil
+		// Report the post-rollback version so the caller can decide whether the app
+		// schema reached version 0 and River should be torn down (decision D2).
+		v, err := provider.GetDBVersion(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("migrate: db version: %w", err)
+		}
+		return v, nil
 	case "status":
+		fmt.Println("goose:")
 		status, err := provider.Status(ctx)
 		if err != nil {
-			return fmt.Errorf("migrate status: %w", err)
+			return 0, fmt.Errorf("migrate status: %w", err)
 		}
 		for _, s := range status {
 			fmt.Printf("%-10s %s\n", s.State, s.Source.Path)
 		}
-		return nil
+		return 0, nil
 	case "version":
 		v, err := provider.GetDBVersion(ctx)
 		if err != nil {
-			return fmt.Errorf("migrate version: %w", err)
+			return 0, fmt.Errorf("migrate version: %w", err)
 		}
-		fmt.Printf("current version: %d\n", v)
-		return nil
+		fmt.Printf("goose version: %d\n", v)
+		return v, nil
 	default:
-		return fmt.Errorf("migrate: unknown action %q", action)
+		return 0, fmt.Errorf("migrate: unknown action %q", action)
 	}
+}
+
+// newGooseProvider builds a goose Provider over the embedded application
+// migrations. fs.Sub narrows the embedded FS to the migrations subdirectory so the
+// Provider sees the .sql files at the root of the FS it is given.
+func newGooseProvider(db *sql.DB) (*goose.Provider, error) {
+	sub, err := fs.Sub(postgres.Migrations, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("migrate: sub filesystem: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, sub)
+	if err != nil {
+		return nil, fmt.Errorf("migrate: new provider: %w", err)
+	}
+	return provider, nil
 }

@@ -3,8 +3,10 @@ package queue
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
@@ -98,12 +100,9 @@ func MigrateRiver(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) 
 
 	// Phase 3: run River's own migrations into the dedicated schema. The migrator
 	// manages its own transaction(s) internally.
-	migrator, err := rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{
-		Schema: riverSchema,
-		Logger: logger,
-	})
+	migrator, err := newRiverMigrator(pool, logger)
 	if err != nil {
-		return fmt.Errorf("queue: new river migrator: %w", err)
+		return err
 	}
 	// nil opts = migrate fully up; idempotent in 0.39.0. We call Migrate, never
 	// Validate, so 0.39.0's Validate-signature change does not affect us.
@@ -148,4 +147,168 @@ func applyRiverGrants(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("commit grant tx: %w", err)
 	}
 	return nil
+}
+
+// newRiverMigrator builds a rivermigrate.Migrator bound to the dedicated `river`
+// schema over the given pool. River's migrator needs a pgxpool-backed driver (the
+// goose path uses database/sql, which rivermigrate cannot consume), so every
+// migrate-phase entry point -- up, teardown, and status -- constructs it the same
+// way here. The migrator's transaction type is pgx.Tx, inferred from the driver.
+func newRiverMigrator(pool *pgxpool.Pool, logger *slog.Logger) (*rivermigrate.Migrator[pgx.Tx], error) {
+	migrator, err := rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{
+		Schema: riverSchema,
+		Logger: logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("queue: new river migrator: %w", err)
+	}
+	return migrator, nil
+}
+
+// TeardownRiver reverses MigrateRiver: it removes every River table and then the
+// `river` schema itself. It is the River half of a full `migrate down` to version
+// 0 (decision D2). The migrate subcommand calls it ONLY when the goose phase has
+// brought the application schema all the way down to version 0; a partial
+// `migrate down` leaves River untouched, because River's tables are a unit and a
+// partial River teardown would leave a broken schema.
+//
+// The sequence is the reverse of MigrateRiver's up (which was CREATE SCHEMA ->
+// rivermigrate up -> grants):
+//
+//  1. rivermigrate down-all -- rolls back every River migration, dropping every
+//     River table (including river_migration).
+//  2. DROP SCHEMA IF EXISTS river -- removes the now-empty schema.
+//
+// Grants are not revoked explicitly: every schema- and table-scoped privilege is
+// dropped together with the schema and its tables (decision D2.3).
+//
+// TeardownRiver is idempotent. down-all on an absent schema is a no-op: River
+// resolves river_migration through to_regclass, which reports "absent" (rather
+// than erroring) when the schema is gone, so ExistingVersions comes back empty and
+// nothing is rolled back; DROP SCHEMA IF EXISTS then tolerates the missing schema.
+//
+// pool must be the migration role's pool; TeardownRiver does not own its lifecycle.
+//
+// NB on the down-all opts: down-all REQUIRES MigrateOpts{TargetVersion: -1}.
+// rivermigrate defaults the down direction to a SINGLE step "for safety" (in
+// v0.39.0 applyMigrations sets maxSteps=1 when TargetVersion==0, which is the
+// nil-opts default), so passing nil here would roll back only the latest River
+// migration and leave the schema non-empty, making the subsequent DROP SCHEMA
+// fail. -1 is River's documented "remove the schema completely" target.
+func TeardownRiver(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
+	migrator, err := newRiverMigrator(pool, logger)
+	if err != nil {
+		return err
+	}
+
+	// Phase 1 (reverse of up phase 3): roll back every applied River migration.
+	res, err := migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{
+		TargetVersion: -1,
+	})
+	if err != nil {
+		return fmt.Errorf("queue: river migrate down-all: %w", err)
+	}
+	logger.InfoContext(ctx, "river migrations rolled back",
+		slog.Int("versions_removed", len(res.Versions)))
+
+	// Phase 2 (reverse of up phase 2): drop the now-empty schema. IF EXISTS keeps
+	// this a no-op when River was never migrated. No CASCADE is needed -- down-all
+	// already removed every table, type, and function River created -- and omitting
+	// it avoids silently dropping anything unexpected that might live in the schema.
+	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS river"); err != nil {
+		return fmt.Errorf("queue: drop river schema: %w", err)
+	}
+	logger.InfoContext(ctx, "river schema dropped", slog.String("schema", riverSchema))
+
+	return nil
+}
+
+// RiverMigrationStatus is a read-only snapshot of River's migration state, used by
+// `migrate status` and `migrate version` to report River alongside goose (decision
+// D1). It is derived from rivermigrate's ExistingVersions (applied in the database)
+// and AllVersions (every migration this River build knows about).
+type RiverMigrationStatus struct {
+	// SchemaPresent is false when the `river` schema is absent -- River was never
+	// migrated, or has been torn down. AppliedVersion, AppliedCount, and Pending are
+	// then zero/empty, while TotalCount still reflects the migrations the build ships.
+	SchemaPresent bool
+	// AppliedVersion is the highest applied River migration version, or 0 if none.
+	AppliedVersion int
+	// AppliedCount is the number of River migrations applied in the database.
+	AppliedCount int
+	// TotalCount is the number of River migrations this build knows about.
+	TotalCount int
+	// Pending lists known-but-unapplied migration versions, ascending. It is empty
+	// after a full `migrate up`, and also empty when SchemaPresent is false (an
+	// absent schema is reported as "not present", not as a list of pending work).
+	Pending []int
+}
+
+// RiverStatus reports River's migration state for the read-only status/version
+// actions (decision D1). It never mutates the database and never fails merely
+// because River is absent: a missing `river` schema yields SchemaPresent=false with
+// a zero version, not an error.
+//
+// pool must be the migration role's pool; RiverStatus does not own its lifecycle.
+func RiverStatus(ctx context.Context, pool *pgxpool.Pool) (RiverMigrationStatus, error) {
+	// A quiet migrator: the read-only queries below never log, but a discard logger
+	// guarantees the status/version output stays free of stray River log lines.
+	migrator, err := newRiverMigrator(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		return RiverMigrationStatus{}, err
+	}
+
+	// AllVersions reads the embedded migration set -- no database access -- so the
+	// total is known even when River is absent.
+	all := migrator.AllVersions()
+	status := RiverMigrationStatus{TotalCount: len(all)}
+
+	// Resolve schema presence explicitly so an absent River is reported as such
+	// (decision D1) rather than as "0 applied". This is the same signal the teardown
+	// round-trip asserts against (information_schema.schemata).
+	present, err := riverSchemaExists(ctx, pool)
+	if err != nil {
+		return RiverMigrationStatus{}, err
+	}
+	if !present {
+		return status, nil
+	}
+	status.SchemaPresent = true
+
+	// ExistingVersions returns the applied migrations ordered ascending by version,
+	// so the last element is the current River version.
+	existing, err := migrator.ExistingVersions(ctx)
+	if err != nil {
+		return RiverMigrationStatus{}, fmt.Errorf("queue: river existing versions: %w", err)
+	}
+	status.AppliedCount = len(existing)
+	if len(existing) > 0 {
+		status.AppliedVersion = existing[len(existing)-1].Version
+	}
+
+	applied := make(map[int]struct{}, len(existing))
+	for _, m := range existing {
+		applied[m.Version] = struct{}{}
+	}
+	for _, m := range all {
+		if _, ok := applied[m.Version]; !ok {
+			status.Pending = append(status.Pending, m.Version)
+		}
+	}
+
+	return status, nil
+}
+
+// riverSchemaExists reports whether the dedicated `river` schema is present. It is
+// the clean-absence probe for RiverStatus: querying information_schema avoids
+// touching river_migration, which may not exist.
+func riverSchemaExists(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
+		riverSchema,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("queue: check river schema: %w", err)
+	}
+	return exists, nil
 }
