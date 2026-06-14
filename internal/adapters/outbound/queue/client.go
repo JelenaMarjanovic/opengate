@@ -23,19 +23,9 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivertype"
-)
 
-// riverAdvisoryLockPrefix namespaces River's internal advisory locks to the
-// high 32 bits = 0x4F47 ("OG" for OpenGate). River shifts this prefix into the
-// top half of the 64-bit advisory-lock key space, so every River lock shares
-// this band and cannot collide with locks taken elsewhere in the application.
-//
-// OpenGate's own application advisory locks come from internal/coordination/
-// advisory.LockID (built in US-03.05) and will be made PROVABLY disjoint from
-// this band by forcing the sign bit on that side — out of scope here. This
-// constant only pins River's band; it must stay a fixed positive int32 so the
-// band never moves and never overlaps a future application lock prefix.
-const riverAdvisoryLockPrefix int32 = 0x4F47
+	"github.com/JelenaMarjanovic/opengate/internal/coordination/advisory"
+)
 
 // riverSchema is the dedicated Postgres schema that holds every River table
 // (decision A1). It is set as Config.Schema on every client and on the migrator,
@@ -141,7 +131,7 @@ func newRiverClient(role RiverRole, pool *pgxpool.Pool, logger *slog.Logger, wc 
 	cfg := &river.Config{
 		Schema:             riverSchema,
 		Logger:             logger,
-		AdvisoryLockPrefix: riverAdvisoryLockPrefix,
+		AdvisoryLockPrefix: advisory.RiverAdvisoryLockPrefix,
 	}
 
 	// Worker overlay. Each role accepts exactly one valid config shape, so a
