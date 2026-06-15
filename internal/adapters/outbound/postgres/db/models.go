@@ -33,13 +33,15 @@ type Event struct {
 	Payload        []byte
 	Metadata       []byte
 	OccurredAt     pgtype.Timestamptz
+	InsertXid      pgtype.Uint64
 }
 
 type ProjectionProgress struct {
-	ProjectorName string
-	LastPosition  int64
-	LastEventAt   pgtype.Timestamptz
-	UpdatedAt     pgtype.Timestamptz
+	ProjectorName   string
+	LastPosition    int64
+	LastEventAt     pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
+	LastConsumedXid pgtype.Uint64
 }
 
 type Session struct {

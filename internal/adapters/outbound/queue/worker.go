@@ -3,13 +3,17 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
+
+	"github.com/JelenaMarjanovic/opengate/internal/projection"
 )
 
 // Worker pool sizing and shutdown timing.
@@ -51,20 +55,45 @@ type WorkerPool struct {
 // NewWorkerPool builds the PRODUCTION worker pool over the BYPASSRLS pool's
 // driver (the worker fetches/works/completes jobs cross-tenant as opengate_bypass).
 //
-// It is deliberately the FOUNDATION only: it polls the default queue with the
-// global trace-extract middleware installed, but registers NO workers. The Workers
-// registry is intentionally empty — no real job kind has a worker yet (those
-// arrive in later epics), and production has no enqueuers for real kinds, so the
-// pool runs and polls but processes nothing until a later story registers one. The
-// test.noop worker is wired only by the AC-1 round-trip test, never here.
+// It registers NO real job kinds on the default queue — those arrive in later
+// epics, and production has no enqueuers for them, so the default queue polls but
+// processes nothing until a later story registers a worker. The test.noop worker is
+// wired only by the AC-1 round-trip test, never here.
+//
+// It DOES land the US-03.05 projector framework wiring: the dedicated projection
+// queue, the single projector worker, and the lag-metrics handle. No real projector
+// is registered yet (the five v1 projectors arrive in their own epics), so the
+// projector list is empty and no periodic job is scheduled — the queue and worker
+// are present but inert. A future epic registers a projector by adding it to
+// projectors here and nothing else changes.
 func NewWorkerPool(pool *pgxpool.Pool, logger *slog.Logger) (*WorkerPool, error) {
+	// Register the lag gauge into the project's default Prometheus registry, so a
+	// future /metrics endpoint (promhttp over the default gatherer) exposes it with
+	// no rewiring. NewMetrics tolerates re-registration.
+	metrics, err := projection.NewMetrics(prometheus.DefaultRegisterer)
+	if err != nil {
+		return nil, fmt.Errorf("queue: projection metrics: %w", err)
+	}
+
+	// Production registers no real projectors yet; the wiring pattern is what lands.
+	var projectors []projection.Projector
+
+	workers := river.NewWorkers()
+	// One worker type serves every projector; register it so the projection.run kind
+	// is known even before a projector is added (no tick is enqueued until one is).
+	river.AddWorker(workers, newProjectorWorker(pool, metrics, projectors))
+
 	wc := &workerConfig{
-		queues:  map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: workerMaxWorkers}},
-		workers: river.NewWorkers(), // intentionally empty — foundation only (Step 3)
+		queues: map[string]river.QueueConfig{
+			river.QueueDefault: {MaxWorkers: workerMaxWorkers},
+			projectionQueue:    {MaxWorkers: projectionQueueMaxWorkers},
+		},
+		workers: workers,
 		// Global trace-extract middleware, registered once for every worked job
 		// (decision B3), mirroring the single insert-side injection point.
 		middleware:      []rivertype.Middleware{&traceMiddleware{}},
 		softStopTimeout: workerSoftStopTimeout,
+		periodicJobs:    projectorPeriodicJobs(projectors),
 	}
 	client, err := newRiverClient(RoleWorker, pool, logger, wc)
 	if err != nil {

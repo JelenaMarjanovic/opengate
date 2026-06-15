@@ -92,6 +92,198 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	// policy. Asserted after the second up so the round-trip also re-applied the
 	// INSERT after a full Down, proving the seed is part of the repeatable Up.
 	assertCasbinPolicySeeded(t, db)
+
+	// US-03.05 additions: the add_events_insert_xid columns/index and the
+	// grant_projection_progress privileges. Asserted after the second up, so the
+	// round-trip also exercised their Down (DROP COLUMN/INDEX, REVOKE) on the way to
+	// zero and re-applied them on the way back up.
+	assertProjectionXidSchema(t, db)
+}
+
+// TestInsertXidMigrationRollback proves the US-03.05 migrations' Down sections in
+// isolation: rolling back grant_projection_progress then add_events_insert_xid
+// removes exactly the two columns and the index while leaving the events table (and
+// the rest of the schema) intact, and a subsequent Up re-creates them. The full
+// round-trip drops events entirely on its way to zero, so it cannot show the column
+// "present then absent while events persists" — this test does.
+func TestInsertXidMigrationRollback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+
+	ctx := context.Background()
+	container := testsupport.StartPostgres(ctx, t)
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	sub, err := fs.Sub(postgres.Migrations, "migrations")
+	if err != nil {
+		t.Fatalf("sub fs: %v", err)
+	}
+	newProvider := func() *goose.Provider {
+		p, err := goose.NewProvider(goose.DialectPostgres, db, sub)
+		if err != nil {
+			t.Fatalf("new provider: %v", err)
+		}
+		return p
+	}
+
+	// Up: the columns and index are present.
+	if _, err := newProvider().Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if !columnExists(t, db, "events", "insert_xid") {
+		t.Fatal("events.insert_xid missing after up")
+	}
+	if !indexExists(t, db, "events_insert_xid_idx") {
+		t.Fatal("events_insert_xid_idx missing after up")
+	}
+	if !columnExists(t, db, "projection_progress", "last_consumed_xid") {
+		t.Fatal("projection_progress.last_consumed_xid missing after up")
+	}
+
+	// Down twice: roll back grant_projection_progress, then add_events_insert_xid.
+	if _, err := newProvider().Down(ctx); err != nil {
+		t.Fatalf("down (grant_projection_progress): %v", err)
+	}
+	if _, err := newProvider().Down(ctx); err != nil {
+		t.Fatalf("down (add_events_insert_xid): %v", err)
+	}
+
+	// The columns and index are gone, but events itself survives.
+	assertTableExists(t, db, "events", true)
+	if columnExists(t, db, "events", "insert_xid") {
+		t.Error("events.insert_xid still present after its migration's Down")
+	}
+	if indexExists(t, db, "events_insert_xid_idx") {
+		t.Error("events_insert_xid_idx still present after its migration's Down")
+	}
+	if columnExists(t, db, "projection_progress", "last_consumed_xid") {
+		t.Error("projection_progress.last_consumed_xid still present after its migration's Down")
+	}
+
+	// Up again re-creates them, proving the Up is repeatable after a partial Down.
+	if _, err := newProvider().Up(ctx); err != nil {
+		t.Fatalf("re-up: %v", err)
+	}
+	if !columnExists(t, db, "events", "insert_xid") {
+		t.Fatal("events.insert_xid missing after re-up")
+	}
+	if !indexExists(t, db, "events_insert_xid_idx") {
+		t.Fatal("events_insert_xid_idx missing after re-up")
+	}
+}
+
+// columnExists reports whether table.column exists (and is not a dropped column),
+// read from pg_attribute so it is independent of any row data.
+func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	var exists bool
+	// table is an in-test constant, safe to cast to ::regclass.
+	if err := db.QueryRow(
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_attribute
+			WHERE attrelid = ($1)::regclass AND attname = $2 AND NOT attisdropped
+		)`, table, column,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check column %s.%s: %v", table, column, err)
+	}
+	return exists
+}
+
+// indexExists reports whether a public-schema index of the given name exists.
+func indexExists(t *testing.T, db *sql.DB, index string) bool {
+	t.Helper()
+	var exists bool
+	if err := db.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1)`, index,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check index %s: %v", index, err)
+	}
+	return exists
+}
+
+// assertProjectionXidSchema verifies the US-03.05 schema: events.insert_xid and
+// projection_progress.last_consumed_xid are both xid8 NOT NULL, the
+// events_insert_xid_idx boundary index exists, and opengate_bypass holds exactly
+// SELECT and UPDATE (not INSERT/DELETE) on projection_progress. Types are read from
+// pg_catalog via format_type, which names xid8 exactly (information_schema would
+// report a generic USER-DEFINED for it).
+func assertProjectionXidSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	for _, c := range []struct {
+		table, column string
+	}{
+		{"events", "insert_xid"},
+		{"projection_progress", "last_consumed_xid"},
+	} {
+		var (
+			typeName string
+			notNull  bool
+		)
+		// The table name is an in-test constant, safe to interpolate into ::regclass.
+		err := db.QueryRow(
+			`SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull
+			 FROM pg_attribute a
+			 WHERE a.attrelid = ($1)::regclass AND a.attname = $2 AND NOT a.attisdropped`,
+			c.table, c.column,
+		).Scan(&typeName, &notNull)
+		if errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("%s.%s column is missing", c.table, c.column)
+		}
+		if err != nil {
+			t.Fatalf("query %s.%s type: %v", c.table, c.column, err)
+		}
+		if typeName != "xid8" {
+			t.Errorf("%s.%s type = %q, want xid8", c.table, c.column, typeName)
+		}
+		if !notNull {
+			t.Errorf("%s.%s is nullable, want NOT NULL", c.table, c.column)
+		}
+	}
+
+	// The boundary index exists.
+	var hasIndex bool
+	if err := db.QueryRow(
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE schemaname = 'public' AND tablename = 'events'
+			  AND indexname = 'events_insert_xid_idx'
+		)`,
+	).Scan(&hasIndex); err != nil {
+		t.Fatalf("query events_insert_xid_idx existence: %v", err)
+	}
+	if !hasIndex {
+		t.Error("events_insert_xid_idx index is missing")
+	}
+
+	// opengate_bypass holds SELECT and UPDATE — and only those — on projection_progress.
+	for _, c := range []struct {
+		// query is a static, in-test constant, safe to pass to has_table_privilege.
+		query string
+		want  bool
+	}{
+		{`SELECT has_table_privilege('opengate_bypass', 'projection_progress', 'SELECT')`, true},
+		{`SELECT has_table_privilege('opengate_bypass', 'projection_progress', 'UPDATE')`, true},
+		{`SELECT has_table_privilege('opengate_bypass', 'projection_progress', 'INSERT')`, false},
+		{`SELECT has_table_privilege('opengate_bypass', 'projection_progress', 'DELETE')`, false},
+	} {
+		var has bool
+		if err := db.QueryRow(c.query).Scan(&has); err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		if has != c.want {
+			t.Errorf("%s = %v, want %v", c.query, has, c.want)
+		}
+	}
 }
 
 // assertAppSessionGrants verifies the grant_app_sessions migration gave
