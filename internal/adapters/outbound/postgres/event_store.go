@@ -169,7 +169,7 @@ func (s *EventStore) Load(ctx context.Context, aggregateID uuid.UUID) ([]events.
 	if err != nil {
 		return nil, fmt.Errorf("load aggregate events: %w: %w", apperr.ErrInternal, err)
 	}
-	return mapEvents(rows)
+	return mapEventRows(rows, widenLoadAggregateEventsRow)
 }
 
 // ReadAfterPosition returns events with stream_position > position, in global
@@ -192,7 +192,7 @@ func (s *EventStore) ReadAfterPosition(ctx context.Context, position int64, limi
 	if err != nil {
 		return nil, fmt.Errorf("read events after position: %w: %w", apperr.ErrInternal, err)
 	}
-	return mapEvents(rows)
+	return mapEventRows(rows, widenReadEventsAfterPositionRow)
 }
 
 // ReadByTenantAndTimeRange returns a tenant's events within the inclusive
@@ -207,16 +207,26 @@ func (s *EventStore) ReadByTenantAndTimeRange(ctx context.Context, tenantID uuid
 	if err != nil {
 		return nil, fmt.Errorf("read tenant events in time range: %w: %w", apperr.ErrInternal, err)
 	}
-	return mapEvents(rows)
+	return mapEventRows(rows, widenReadTenantEventsInTimeRangeRow)
 }
 
-// mapEvents maps a slice of generated db.Event rows to domain events, returning a
+// mapEventRows maps a slice of sqlc events-read rows to domain events, returning a
 // non-nil empty slice when there are no rows so callers can range over the result
 // uniformly. A malformed metadata row is a wrapped internal error.
-func mapEvents(rows []db.Event) ([]events.Event, error) {
+//
+// It is generic over the row type because the three reads (LoadAggregateEvents,
+// ReadEventsAfterPosition, ReadTenantEventsInTimeRange) each select every events
+// column EXCEPT the infrastructure-only insert_xid (an xid8 the projector consumes
+// through hand-written SQL, never the domain reads). Selecting a strict subset of
+// the table makes sqlc emit a distinct, field-identical *Row struct per query
+// instead of the shared db.Event model; widen lifts each into db.Event — its
+// InsertXid stays zero, the reads never fetch it — so the per-row mapping in
+// mapEvent stays single-sourced.
+func mapEventRows[T any](rows []T, widen func(*T) db.Event) ([]events.Event, error) {
 	out := make([]events.Event, 0, len(rows))
 	for i := range rows {
-		evt, err := mapEvent(&rows[i])
+		row := widen(&rows[i])
+		evt, err := mapEvent(&row)
 		if err != nil {
 			return nil, err
 		}
@@ -246,4 +256,34 @@ func mapEvent(row *db.Event) (events.Event, error) {
 		Payload:        json.RawMessage(row.Payload),
 		Metadata:       metadata,
 	}, nil
+}
+
+// widenLoadAggregateEventsRow, widenReadEventsAfterPositionRow, and
+// widenReadTenantEventsInTimeRangeRow lift the three field-identical sqlc read rows
+// into the shared db.Event carrier that mapEventRows maps from. Each read query
+// omits insert_xid (see mapEventRows), so InsertXid is deliberately left at its
+// zero value. They exist only because Go's nominal typing makes the three
+// structurally identical *Row types distinct, so one cannot stand in for another.
+func widenLoadAggregateEventsRow(r *db.LoadAggregateEventsRow) db.Event {
+	return db.Event{
+		ID: r.ID, TenantID: r.TenantID, AggregateID: r.AggregateID, AggregateType: r.AggregateType,
+		Sequence: r.Sequence, StreamPosition: r.StreamPosition, EventType: r.EventType,
+		Payload: r.Payload, Metadata: r.Metadata, OccurredAt: r.OccurredAt,
+	}
+}
+
+func widenReadEventsAfterPositionRow(r *db.ReadEventsAfterPositionRow) db.Event {
+	return db.Event{
+		ID: r.ID, TenantID: r.TenantID, AggregateID: r.AggregateID, AggregateType: r.AggregateType,
+		Sequence: r.Sequence, StreamPosition: r.StreamPosition, EventType: r.EventType,
+		Payload: r.Payload, Metadata: r.Metadata, OccurredAt: r.OccurredAt,
+	}
+}
+
+func widenReadTenantEventsInTimeRangeRow(r *db.ReadTenantEventsInTimeRangeRow) db.Event {
+	return db.Event{
+		ID: r.ID, TenantID: r.TenantID, AggregateID: r.AggregateID, AggregateType: r.AggregateType,
+		Sequence: r.Sequence, StreamPosition: r.StreamPosition, EventType: r.EventType,
+		Payload: r.Payload, Metadata: r.Metadata, OccurredAt: r.OccurredAt,
+	}
 }

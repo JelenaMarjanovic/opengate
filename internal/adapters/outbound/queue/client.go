@@ -83,6 +83,9 @@ func (r RiverRole) String() string {
 //     jobs get this long to finish before River cancels their contexts; the
 //     worker subcommand sets it to the shutdown grace budget minus a margin
 //     (decision A3).
+//   - PeriodicJobs: jobs River inserts on a fixed interval. The projector framework
+//     (US-03.05) registers one periodic job per projector here; it is empty when no
+//     projector is registered.
 //
 // It is a *workerConfig: nil (and required-nil) for RoleAPI, non-nil for
 // RoleWorker. Keeping it a pointer makes the "worker-only" nature explicit at
@@ -93,6 +96,7 @@ type workerConfig struct {
 	workers         *river.Workers
 	middleware      []rivertype.Middleware
 	softStopTimeout time.Duration
+	periodicJobs    []*river.PeriodicJob
 }
 
 // newRiverClient builds a River client for the given role over pool's driver.
@@ -146,6 +150,7 @@ func newRiverClient(role RiverRole, pool *pgxpool.Pool, logger *slog.Logger, wc 
 		cfg.Workers = wc.workers
 		cfg.Middleware = wc.middleware
 		cfg.SoftStopTimeout = wc.softStopTimeout
+		cfg.PeriodicJobs = wc.periodicJobs
 	case RoleAPI:
 		if wc != nil {
 			return nil, fmt.Errorf("queue: worker config supplied for insert-only river %s client", role)

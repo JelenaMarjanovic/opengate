@@ -89,3 +89,27 @@ func WithLock(ctx context.Context, tx pgx.Tx, name string, fn func() error) erro
 	}
 	return fn()
 }
+
+// TryWithLock attempts to acquire the transaction-scoped advisory lock identified
+// by name on the given transaction WITHOUT blocking. If the lock is free it is
+// acquired (held until the caller commits or rolls back tx), fn is run, and
+// (true, fn's error) is returned. If the lock is already held by another
+// transaction, fn is NOT run and (false, nil) is returned immediately.
+//
+// This is the non-blocking counterpart to WithLock, used by periodic singleton
+// work (projectors, maintenance jobs) that should SKIP an iteration rather than
+// wait when another instance already holds the lock. pg_try_advisory_xact_lock
+// never waits: it reports the outcome in the boolean it returns, so the caller can
+// no-op a contended iteration cheaply instead of queueing behind the holder.
+//
+// fn's error is returned unwrapped (when acquired) so callers can inspect it.
+func TryWithLock(ctx context.Context, tx pgx.Tx, name string, fn func() error) (bool, error) {
+	var acquired bool
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", LockID(name)).Scan(&acquired); err != nil {
+		return false, fmt.Errorf("try advisory lock %q: %w", name, err)
+	}
+	if !acquired {
+		return false, nil
+	}
+	return true, fn()
+}

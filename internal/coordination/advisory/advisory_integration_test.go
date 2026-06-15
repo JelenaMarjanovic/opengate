@@ -280,6 +280,180 @@ func TestWithLock_ReleaseOnRollback(t *testing.T) {
 	}
 }
 
+// I6 — TryWithLock on a FREE lock acquires and runs fn. The non-blocking path's
+// happy case: nothing else holds the lock, so the try succeeds and fn executes.
+func TestTryWithLock_AcquiresFreeLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+	ctx := context.Background()
+	env := setupAdvisory(ctx, t)
+	const name = "projector.try_free"
+
+	tx, err := env.poolA.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ran := false
+	acquired, err := advisory.TryWithLock(ctx, tx, name, func() error { ran = true; return nil })
+	if err != nil {
+		t.Fatalf("TryWithLock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("TryWithLock did not acquire a free lock")
+	}
+	if !ran {
+		t.Fatal("fn did not run after a successful try-acquire")
+	}
+}
+
+// I7 — TryWithLock SKIPS a held lock without blocking, then a fresh try acquires it
+// once the holder releases. This is the projector singleton property: a second
+// instance that finds the lock taken must no-op immediately (fn not run,
+// acquired=false) rather than queue, and the lock must become acquirable again the
+// moment the holder's transaction ends.
+func TestTryWithLock_SkipsWhenHeldThenAcquiresAfterRelease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+	ctx := context.Background()
+	env := setupAdvisory(ctx, t)
+	const name = "projector.try_held"
+
+	aHeld := make(chan struct{})   // closed once A holds the lock
+	release := make(chan struct{}) // closed to let A's fn return
+	aDone := make(chan error, 1)
+
+	// A: hold the lock, signal, block until released, then commit (releasing it).
+	go func() {
+		txA, err := env.poolA.Begin(ctx)
+		if err != nil {
+			aDone <- err
+			return
+		}
+		err = advisory.WithLock(ctx, txA, name, func() error {
+			close(aHeld)
+			<-release
+			return nil
+		})
+		if err != nil {
+			_ = txA.Rollback(ctx)
+			aDone <- err
+			return
+		}
+		aDone <- txA.Commit(ctx)
+	}()
+
+	<-aHeld
+
+	// B: try the held lock on a second session. The call must return IMMEDIATELY
+	// with acquired=false and must not run fn — no goroutine needed precisely
+	// because TryWithLock never blocks.
+	txB, err := env.poolB.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx B: %v", err)
+	}
+	var bFnRan atomic.Bool
+	acquired, err := advisory.TryWithLock(ctx, txB, name, func() error { bFnRan.Store(true); return nil })
+	if err != nil {
+		t.Fatalf("B TryWithLock: %v", err)
+	}
+	if acquired {
+		t.Fatal("B acquired a lock already held by A")
+	}
+	if bFnRan.Load() {
+		t.Fatal("B fn ran even though the lock was not acquired")
+	}
+	_ = txB.Rollback(ctx)
+
+	// Release A and wait for its commit, freeing the lock.
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Fatalf("A goroutine: %v", err)
+	}
+
+	// C: a fresh try on the same name now succeeds, proving the lock was released.
+	txC, err := env.poolB.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx C: %v", err)
+	}
+	defer func() { _ = txC.Rollback(ctx) }()
+	ranC := false
+	acquiredC, err := advisory.TryWithLock(ctx, txC, name, func() error { ranC = true; return nil })
+	if err != nil {
+		t.Fatalf("C TryWithLock: %v", err)
+	}
+	if !acquiredC {
+		t.Fatal("C did not acquire the lock after A released it")
+	}
+	if !ranC {
+		t.Fatal("C fn did not run after acquiring the released lock")
+	}
+}
+
+// I8 — distinct names do not contend under TryWithLock either: while A holds N1, a
+// try on N2 acquires immediately.
+func TestTryWithLock_DistinctNamesBothAcquire(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping container-backed test in short mode")
+	}
+	ctx := context.Background()
+	env := setupAdvisory(ctx, t)
+	const n1 = "projector.try_alpha"
+	const n2 = "projector.try_beta"
+
+	aHeld := make(chan struct{})
+	release := make(chan struct{})
+	aDone := make(chan error, 1)
+
+	go func() {
+		txA, err := env.poolA.Begin(ctx)
+		if err != nil {
+			aDone <- err
+			return
+		}
+		err = advisory.WithLock(ctx, txA, n1, func() error {
+			close(aHeld)
+			<-release
+			return nil
+		})
+		if err != nil {
+			_ = txA.Rollback(ctx)
+			aDone <- err
+			return
+		}
+		aDone <- txA.Commit(ctx)
+	}()
+
+	<-aHeld
+
+	// B tries a DIFFERENT name; it must acquire without blocking on A.
+	txB, err := env.poolB.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx B: %v", err)
+	}
+	defer func() { _ = txB.Rollback(ctx) }()
+	ranB := false
+	acquired, err := advisory.TryWithLock(ctx, txB, n2, func() error { ranB = true; return nil })
+	if err != nil {
+		t.Fatalf("B TryWithLock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("B failed to acquire a distinct lock name while A held another")
+	}
+	if !ranB {
+		t.Fatal("B fn did not run after acquiring a distinct lock")
+	}
+
+	// Clean up A.
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Fatalf("A goroutine: %v", err)
+	}
+}
+
 // I5 — cancellation interrupts the wait (graceful-shutdown property). While A
 // holds the lock, B waits with a cancellable context; canceling it must unblock
 // B promptly with an error, and B's fn must never run (acquisition failed).

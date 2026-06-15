@@ -20,21 +20,34 @@ WHERE aggregate_id = $1
 ORDER BY sequence
 `
 
+type LoadAggregateEventsRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	AggregateID    uuid.UUID
+	AggregateType  string
+	Sequence       int64
+	StreamPosition int64
+	EventType      string
+	Payload        []byte
+	Metadata       []byte
+	OccurredAt     pgtype.Timestamptz
+}
+
 // Backs EventStore.Load (US-03.03, AC3): every event for one aggregate in
 // sequence order. Runs on the RLS-bound pool (opengate_app) -- the command path
 // loads an aggregate's history before deciding the next command, with the tenant
 // already bound, so RLS scopes the read to the caller's tenant. ORDER BY sequence
 // gives the deterministic 1-based replay order the aggregate rebuild depends on,
 // served by the events_aggregate_sequence_unique index (aggregate_id, sequence).
-func (q *Queries) LoadAggregateEvents(ctx context.Context, aggregateID uuid.UUID) ([]Event, error) {
+func (q *Queries) LoadAggregateEvents(ctx context.Context, aggregateID uuid.UUID) ([]LoadAggregateEventsRow, error) {
 	rows, err := q.db.Query(ctx, loadAggregateEvents, aggregateID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Event
+	var items []LoadAggregateEventsRow
 	for rows.Next() {
-		var i Event
+		var i LoadAggregateEventsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -71,6 +84,19 @@ type ReadEventsAfterPositionParams struct {
 	Limit          int32
 }
 
+type ReadEventsAfterPositionRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	AggregateID    uuid.UUID
+	AggregateType  string
+	Sequence       int64
+	StreamPosition int64
+	EventType      string
+	Payload        []byte
+	Metadata       []byte
+	OccurredAt     pgtype.Timestamptz
+}
+
 // Backs EventStore.ReadAfterPosition: events whose stream_position is strictly
 // greater than a cursor, in global (monotonic) order, capped by a limit. Runs on
 // the BYPASSRLS pool (opengate_bypass) -- projector workers walk the whole store
@@ -78,15 +104,15 @@ type ReadEventsAfterPositionParams struct {
 // ORDER BY stream_position makes the scan gap-free and resumable, served by the
 // events_stream_position_idx index. The LIMIT is the projector's page size; sqlc
 // names it Limit, which the adapter fills from the port's `limit int`.
-func (q *Queries) ReadEventsAfterPosition(ctx context.Context, arg ReadEventsAfterPositionParams) ([]Event, error) {
+func (q *Queries) ReadEventsAfterPosition(ctx context.Context, arg ReadEventsAfterPositionParams) ([]ReadEventsAfterPositionRow, error) {
 	rows, err := q.db.Query(ctx, readEventsAfterPosition, arg.StreamPosition, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Event
+	var items []ReadEventsAfterPositionRow
 	for rows.Next() {
-		var i Event
+		var i ReadEventsAfterPositionRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -125,6 +151,19 @@ type ReadTenantEventsInTimeRangeParams struct {
 	ToTime   pgtype.Timestamptz
 }
 
+type ReadTenantEventsInTimeRangeRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	AggregateID    uuid.UUID
+	AggregateType  string
+	Sequence       int64
+	StreamPosition int64
+	EventType      string
+	Payload        []byte
+	Metadata       []byte
+	OccurredAt     pgtype.Timestamptz
+}
+
 // Backs EventStore.ReadByTenantAndTimeRange: one tenant's events within an
 // INCLUSIVE [from, to] time window (System Design §2), in deterministic
 // chronological order. Runs on the BYPASSRLS pool (opengate_bypass) -- the export
@@ -136,15 +175,15 @@ type ReadTenantEventsInTimeRangeParams struct {
 // self-documenting FromTime/ToTime fields (from/to alone are reserved SQL words).
 // The (occurred_at, stream_position) sort breaks ties on identical timestamps so
 // the export is reproducible, served by the events_tenant_occurred_at_idx index.
-func (q *Queries) ReadTenantEventsInTimeRange(ctx context.Context, arg ReadTenantEventsInTimeRangeParams) ([]Event, error) {
+func (q *Queries) ReadTenantEventsInTimeRange(ctx context.Context, arg ReadTenantEventsInTimeRangeParams) ([]ReadTenantEventsInTimeRangeRow, error) {
 	rows, err := q.db.Query(ctx, readTenantEventsInTimeRange, arg.TenantID, arg.FromTime, arg.ToTime)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Event
+	var items []ReadTenantEventsInTimeRangeRow
 	for rows.Next() {
-		var i Event
+		var i ReadTenantEventsInTimeRangeRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
