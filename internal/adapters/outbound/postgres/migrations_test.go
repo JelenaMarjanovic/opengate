@@ -15,6 +15,12 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
+// grantEventsVersion is the goose version (timestamp) of the grant_events
+// migration (20260608090300_grant_events.sql), the one immediately below
+// add_events_insert_xid. TestInsertXidMigrationRollback rolls down to it to
+// isolate the xid pair's Down without depending on how many migrations sit above.
+const grantEventsVersion int64 = 20260608090300
+
 // TestMigrationsRoundTrip applies every migration up, rolls every
 // migration down, then applies up again. It exercises the Down sections,
 // which would otherwise rot untested. The test runs against a throwaway
@@ -98,14 +104,25 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	// round-trip also exercised their Down (DROP COLUMN/INDEX, REVOKE) on the way to
 	// zero and re-applied them on the way back up.
 	assertProjectionXidSchema(t, db)
+
+	// US-03.06 commit 1 additions: the three idempotency cache tables' RLS and the
+	// command/cleanup grants. Asserted after the second up, so the round-trip also
+	// exercised their Down (DROP POLICY / DISABLE RLS / REVOKE) on the way to zero
+	// and re-applied them on the way back up.
+	assertIdempotencyKeysSchema(t, db)
 }
 
 // TestInsertXidMigrationRollback proves the US-03.05 migrations' Down sections in
-// isolation: rolling back grant_projection_progress then add_events_insert_xid
+// isolation: rolling back grant_projection_progress and add_events_insert_xid
 // removes exactly the two columns and the index while leaving the events table (and
-// the rest of the schema) intact, and a subsequent Up re-creates them. The full
-// round-trip drops events entirely on its way to zero, so it cannot show the column
-// "present then absent while events persists" — this test does.
+// the rest of the schema below them) intact, and a subsequent Up re-creates them.
+// The full round-trip drops events entirely on its way to zero, so it cannot show
+// the column "present then absent while events persists" — this test does.
+//
+// It rolls down to grantEventsVersion (the migration immediately below
+// add_events_insert_xid) rather than counting a fixed number of Down steps, so it
+// stays correct as later stories stack further migrations on top of the xid pair —
+// e.g. US-03.06 adds the idempotency tables above it.
 func TestInsertXidMigrationRollback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping container-backed test in short mode")
@@ -149,12 +166,14 @@ func TestInsertXidMigrationRollback(t *testing.T) {
 		t.Fatal("projection_progress.last_consumed_xid missing after up")
 	}
 
-	// Down twice: roll back grant_projection_progress, then add_events_insert_xid.
-	if _, err := newProvider().Down(ctx); err != nil {
-		t.Fatalf("down (grant_projection_progress): %v", err)
-	}
-	if _, err := newProvider().Down(ctx); err != nil {
-		t.Fatalf("down (add_events_insert_xid): %v", err)
+	// Roll down to the migration immediately below add_events_insert_xid. This
+	// reverses every migration above grant_events — including the xid pair under
+	// test (and any later stories stacked on top, such as the US-03.06 idempotency
+	// tables) — while keeping events itself, which is created below the target.
+	// Targeting a version rather than counting Down steps keeps the test robust as
+	// the migration stack grows.
+	if _, err := newProvider().DownTo(ctx, grantEventsVersion); err != nil {
+		t.Fatalf("down to grant_events (%d): %v", grantEventsVersion, err)
 	}
 
 	// The columns and index are gone, but events itself survives.
@@ -286,6 +305,139 @@ func assertProjectionXidSchema(t *testing.T, db *sql.DB) {
 	}
 }
 
+// assertIdempotencyKeysSchema verifies the US-03.06 commit 1 schema: each of the
+// three idempotency cache tables carries tenant_isolation RLS (ENABLE + FORCE plus
+// a policy named tenant_isolation), command_idempotency_keys carries the
+// response_headers column the middleware replays from, and the command/cleanup
+// grants are exactly those the later commits need. RLS state is read from pg_class
+// (relrowsecurity/relforcerowsecurity), the policy from pg_policies, the column
+// type from pg_catalog via format_type, and grants from has_table_privilege. All
+// are catalog reads, independent of any row data.
+//
+// The grant probe also pins the negative space the prompt calls out: opengate_app
+// has SELECT and INSERT but NOT UPDATE (the record statement is INSERT ... ON
+// CONFLICT DO NOTHING, which needs no UPDATE) and NOT DELETE on
+// command_idempotency_keys; opengate_bypass has DELETE on the command and decision
+// tables but no app grant leaks onto the decision table (its app grants are E4).
+func assertIdempotencyKeysSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	// Every idempotency table has RLS enabled, forced, and a tenant_isolation policy.
+	for _, table := range []string{
+		"command_idempotency_keys",
+		"decision_idempotency_keys",
+		"reconciliation_idempotency_keys",
+	} {
+		var (
+			rowSecurity   bool
+			forceSecurity bool
+		)
+		if err := db.QueryRow(
+			`SELECT relrowsecurity, relforcerowsecurity
+			 FROM pg_class WHERE oid = ($1)::regclass`, table,
+		).Scan(&rowSecurity, &forceSecurity); err != nil {
+			t.Fatalf("query RLS state for %s: %v", table, err)
+		}
+		if !rowSecurity {
+			t.Errorf("%s does not have ROW LEVEL SECURITY enabled", table)
+		}
+		if !forceSecurity {
+			t.Errorf("%s does not have FORCE ROW LEVEL SECURITY", table)
+		}
+
+		var hasPolicy bool
+		if err := db.QueryRow(
+			`SELECT EXISTS (
+				SELECT 1 FROM pg_policies
+				WHERE schemaname = 'public' AND tablename = $1 AND policyname = 'tenant_isolation'
+			)`, table,
+		).Scan(&hasPolicy); err != nil {
+			t.Fatalf("query tenant_isolation policy for %s: %v", table, err)
+		}
+		if !hasPolicy {
+			t.Errorf("%s is missing the tenant_isolation policy", table)
+		}
+	}
+
+	// command_idempotency_keys.response_headers is jsonb NOT NULL DEFAULT '{}'. The
+	// middleware serializes the whitelisted response headers into it, so a replay
+	// reproduces the original's Content-Type/Location/ETag instead of letting
+	// net/http sniff a content type from the replayed body. The default matters: it
+	// makes the column safe for any writer that does not set it (and made the column
+	// addable to the existing table without a backfill).
+	//
+	// Scope check: ONLY the command table has it. The decision path is an
+	// in-transaction use-case concern (E4) storing decision/reason_code/response_body,
+	// not an HTTP response cache, so a response_headers column appearing there would
+	// be a scope error, not a convenience.
+	var (
+		headersType    string
+		headersNotNull bool
+		headersDefault *string
+	)
+	if err := db.QueryRow(
+		`SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull,
+		        pg_get_expr(d.adbin, d.adrelid)
+		 FROM pg_attribute a
+		 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+		 WHERE a.attrelid = ('command_idempotency_keys')::regclass
+		   AND a.attname = 'response_headers' AND NOT a.attisdropped`,
+	).Scan(&headersType, &headersNotNull, &headersDefault); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			t.Fatal("command_idempotency_keys.response_headers column is missing")
+		}
+		t.Fatalf("query command_idempotency_keys.response_headers: %v", err)
+	}
+	if headersType != "jsonb" {
+		t.Errorf("command_idempotency_keys.response_headers type = %q, want jsonb", headersType)
+	}
+	if !headersNotNull {
+		t.Error("command_idempotency_keys.response_headers is nullable, want NOT NULL")
+	}
+	if headersDefault == nil || *headersDefault != `'{}'::jsonb` {
+		got := "<none>"
+		if headersDefault != nil {
+			got = *headersDefault
+		}
+		t.Errorf("command_idempotency_keys.response_headers default = %s, want '{}'::jsonb", got)
+	}
+	if columnExists(t, db, "decision_idempotency_keys", "response_headers") {
+		t.Error("decision_idempotency_keys has a response_headers column; the header cache is the command path only")
+	}
+
+	// The exact grant set. opengate_app: SELECT, INSERT on command (no UPDATE/DELETE);
+	// opengate_bypass: DELETE on command and decision (and nothing more leaked onto
+	// the decision table's app role).
+	//
+	// Re-probed after response_headers was added: the grant is table-level, so a new
+	// column needs no grant edit — this pins that the grant set did not shift.
+	for _, c := range []struct {
+		// query is a static, in-test constant (no user input), safe to pass to
+		// has_table_privilege as a literal.
+		query string
+		want  bool
+	}{
+		{`SELECT has_table_privilege('opengate_app', 'command_idempotency_keys', 'SELECT')`, true},
+		{`SELECT has_table_privilege('opengate_app', 'command_idempotency_keys', 'INSERT')`, true},
+		{`SELECT has_table_privilege('opengate_app', 'command_idempotency_keys', 'UPDATE')`, false},
+		{`SELECT has_table_privilege('opengate_app', 'command_idempotency_keys', 'DELETE')`, false},
+		{`SELECT has_table_privilege('opengate_bypass', 'command_idempotency_keys', 'DELETE')`, true},
+		{`SELECT has_table_privilege('opengate_bypass', 'decision_idempotency_keys', 'DELETE')`, true},
+		// Deferred grants: the decision table's app access is E4, so opengate_app
+		// must hold nothing on it yet.
+		{`SELECT has_table_privilege('opengate_app', 'decision_idempotency_keys', 'SELECT')`, false},
+		{`SELECT has_table_privilege('opengate_app', 'decision_idempotency_keys', 'INSERT')`, false},
+	} {
+		var has bool
+		if err := db.QueryRow(c.query).Scan(&has); err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		if has != c.want {
+			t.Errorf("%s = %v, want %v", c.query, has, c.want)
+		}
+	}
+}
+
 // assertAppSessionGrants verifies the grant_app_sessions migration gave
 // opengate_app exactly UPDATE and DELETE on sessions — the privileges the
 // authenticated session paths need — and withheld INSERT and SELECT (sessions
@@ -402,6 +554,9 @@ func assertSchemaPresent(t *testing.T, db *sql.DB, want bool) {
 	assertTableExists(t, db, "users", want)
 	assertTableExists(t, db, "sessions", want)
 	assertTableExists(t, db, "casbin_rules", want)
+	assertTableExists(t, db, "command_idempotency_keys", want)
+	assertTableExists(t, db, "decision_idempotency_keys", want)
+	assertTableExists(t, db, "reconciliation_idempotency_keys", want)
 	assertRoleExists(t, db, "opengate_bypass", want)
 }
 

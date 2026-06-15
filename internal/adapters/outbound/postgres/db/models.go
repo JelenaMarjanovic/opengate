@@ -22,6 +22,25 @@ type CasbinRule struct {
 	V5    *string
 }
 
+type CommandIdempotencyKey struct {
+	TenantID        uuid.UUID
+	IdempotencyKey  string
+	RequestHash     []byte
+	ResponseStatus  int32
+	ResponseHeaders []byte
+	ResponseBody    []byte
+	CreatedAt       pgtype.Timestamptz
+}
+
+type DecisionIdempotencyKey struct {
+	TenantID       uuid.UUID
+	IdempotencyKey string
+	Decision       string
+	ReasonCode     string
+	ResponseBody   []byte
+	CreatedAt      pgtype.Timestamptz
+}
+
 type Event struct {
 	ID             uuid.UUID
 	TenantID       uuid.UUID
@@ -42,6 +61,14 @@ type ProjectionProgress struct {
 	LastEventAt     pgtype.Timestamptz
 	UpdatedAt       pgtype.Timestamptz
 	LastConsumedXid pgtype.Uint64
+}
+
+type ReconciliationIdempotencyKey struct {
+	TenantID   uuid.UUID
+	ReaderID   uuid.UUID
+	SequenceNo int64
+	EventID    uuid.UUID
+	CreatedAt  pgtype.Timestamptz
 }
 
 type Session struct {
