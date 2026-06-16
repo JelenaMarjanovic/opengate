@@ -87,6 +87,24 @@ func (m problemMapping) typeURI() string { return problemTypeBase + m.typeSlug }
 // through the same WriteProblem path as every other error (one rendering seam).
 var errNotReady = errors.New("service not ready")
 
+// The command idempotency middleware (idempotency.go) raises these three
+// transport-level sentinels for client mistakes it detects before, or instead
+// of, the wrapped handler. Like errNotReady they are unexported, raised only
+// inside this adapter, and rendered through WriteProblem via problemTable so they
+// share the one Problem Details seam:
+//
+//   - errIdempotencyKeyRequired: a mutating request arrived without a usable
+//     Idempotency-Key header (absent, empty, or implausibly long) -> 400.
+//   - errIdempotencyKeyMismatch: the key was already used, but with a different
+//     request body (same key, different payload) -> 409.
+//   - errRequestBodyTooLarge: the request body exceeds the size the middleware can
+//     hash and idempotency-protect -> 413.
+var (
+	errIdempotencyKeyRequired = errors.New("idempotency key required")
+	errIdempotencyKeyMismatch = errors.New("idempotency key payload mismatch")
+	errRequestBodyTooLarge    = errors.New("request body too large")
+)
+
 // defaultProblem is the fail-safe mapping for any error not found in the table:
 // a generic 500. An unmapped error must never render as anything other than a
 // generic 500, so a forgotten mapping row fails safe (no detail leaks, no wrong
@@ -153,6 +171,26 @@ var problemTable = []struct {
 		title:    "Forbidden",
 		status:   http.StatusForbidden,
 		detail:   "You do not have permission to perform this action.",
+	}},
+	// Command idempotency middleware client errors (US-03.06). All three details
+	// are static and disclose no per-request data, consistent with every other row.
+	{errIdempotencyKeyRequired, problemMapping{
+		typeSlug: "idempotency-key-required",
+		title:    "Idempotency-Key required",
+		status:   http.StatusBadRequest,
+		detail:   "This endpoint requires a valid Idempotency-Key header.",
+	}},
+	{errIdempotencyKeyMismatch, problemMapping{
+		typeSlug: "idempotency-key-conflict",
+		title:    "Idempotency-Key conflict",
+		status:   http.StatusConflict,
+		detail:   "This Idempotency-Key was already used with a different request payload.",
+	}},
+	{errRequestBodyTooLarge, problemMapping{
+		typeSlug: "request-body-too-large",
+		title:    "Request body too large",
+		status:   http.StatusRequestEntityTooLarge,
+		detail:   "The request body exceeds the maximum size accepted for an idempotent request.",
 	}},
 	{errNotReady, problemMapping{
 		typeSlug: "service-unavailable",
