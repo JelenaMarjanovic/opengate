@@ -427,6 +427,25 @@ func assertIdempotencyKeysSchema(t *testing.T, db *sql.DB) {
 		// must hold nothing on it yet.
 		{`SELECT has_table_privilege('opengate_app', 'decision_idempotency_keys', 'SELECT')`, false},
 		{`SELECT has_table_privilege('opengate_app', 'decision_idempotency_keys', 'INSERT')`, false},
+
+		// US-03.06 commit 3 (20260615091300): the cleanup job's DELETE reads created_at
+		// in its qualifier, and Postgres checks SELECT per column on read columns — so
+		// DELETE alone made the purge fail with "permission denied". The corrective
+		// grant is COLUMN-level: created_at is readable, the table as a whole is not,
+		// so the worker role can find expired rows but cannot read the cached response
+		// bodies they hold. The false table-level probes below are the least-privilege
+		// half of that pair, not an oversight.
+		{`SELECT has_column_privilege('opengate_bypass', 'command_idempotency_keys', 'created_at', 'SELECT')`, true},
+		{`SELECT has_column_privilege('opengate_bypass', 'decision_idempotency_keys', 'created_at', 'SELECT')`, true},
+		{`SELECT has_column_privilege('opengate_bypass', 'command_idempotency_keys', 'response_body', 'SELECT')`, false},
+		{`SELECT has_column_privilege('opengate_bypass', 'decision_idempotency_keys', 'response_body', 'SELECT')`, false},
+		{`SELECT has_table_privilege('opengate_bypass', 'command_idempotency_keys', 'SELECT')`, false},
+		{`SELECT has_table_privilege('opengate_bypass', 'decision_idempotency_keys', 'SELECT')`, false},
+
+		// reconciliation_idempotency_keys is never purged, so the worker role holds
+		// nothing on it — the grant that makes a mistaken purge fail loudly.
+		{`SELECT has_table_privilege('opengate_bypass', 'reconciliation_idempotency_keys', 'DELETE')`, false},
+		{`SELECT has_column_privilege('opengate_bypass', 'reconciliation_idempotency_keys', 'created_at', 'SELECT')`, false},
 	} {
 		var has bool
 		if err := db.QueryRow(c.query).Scan(&has); err != nil {
