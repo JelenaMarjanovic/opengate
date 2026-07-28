@@ -23,10 +23,13 @@ import (
 // ONLY that pool — no regular RLS pool, no DATABASE_URL — so it validates and
 // opens just BYPASS_RLS_DATABASE_URL.
 //
-// This is the pool FOUNDATION (Step 3): NewWorkerPool registers no workers, so the
-// pool polls the default queue but processes nothing until a later story adds a
-// real job kind and its worker. The full enqueue->process path is already granted
-// (Steps 1-2); nothing is added here.
+// The pool now runs real work: NewWorkerPool registers the US-03.06
+// cleanup.idempotency_keys retention job on the maintenance queue, alongside the
+// (still projector-less) projection queue. The default queue keeps polling with no
+// registered kind until a later epic adds one. The retention DELETEs run under this
+// same opengate_bypass identity, which is why the job needs both the DELETE grant
+// and the column-level SELECT on created_at that migrations 20260615091200 and
+// 20260615091300 install — BYPASSRLS waives row-level security, never privileges.
 func runWorker(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	// Validate the one DSN the worker needs before acquiring any resource, mirroring
 	// runAPI's validate-before-acquire. The DSNs are optional in config (migrate must

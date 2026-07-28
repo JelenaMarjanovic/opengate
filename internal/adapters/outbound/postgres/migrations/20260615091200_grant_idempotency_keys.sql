@@ -19,11 +19,18 @@
 GRANT SELECT, INSERT ON command_idempotency_keys TO opengate_app;
 
 -- opengate_bypass -- the BYPASSRLS worker pool, used by the cleanup job (commit 3):
---   DELETE -- the cleanup is `DELETE ... WHERE created_at < ...`; DELETE privilege
---            covers the predicate, so no separate SELECT is needed.
+--   DELETE -- the cleanup is `DELETE ... WHERE created_at < ...`.
 -- It runs against both purged tables. BYPASSRLS exempts the role from row-level
 -- security but NOT from table privileges (the US-03.05 projection_progress lesson),
 -- so this grant is required for the cleanup to run in production.
+--
+-- NOT SUFFICIENT on its own: the claim originally written here -- that DELETE covers
+-- the predicate, so no SELECT is needed -- is false. Postgres also requires SELECT on
+-- each column READ to evaluate the qualifier, i.e. created_at. The follow-up
+-- migration 20260615091300 adds the minimal column-level `SELECT (created_at)`; see
+-- its header for the empirical evidence. This comment is corrected rather than the
+-- DDL: the grant above is right, it was merely incomplete, and migrations are
+-- append-only once written.
 GRANT DELETE ON command_idempotency_keys TO opengate_bypass;
 GRANT DELETE ON decision_idempotency_keys TO opengate_bypass;
 -- +goose StatementEnd
