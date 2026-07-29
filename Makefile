@@ -14,6 +14,15 @@ GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT         := $(PROJECT_BIN)/golangci-lint
 OPENGATE_BIN          := $(PROJECT_BIN)/opengate
 
+# Tracking artifacts: the story and epic CSVs are derived from the planning
+# corpus. The CSVs are listed explicitly rather than as $(TRACKING_DIR)/*.csv
+# because the drift check below diffs exactly this list — see tracking-check.
+PLAN_DOC             := docs/planning/opengate-implementation-plan-v1.md
+TRACKING_DIR         := docs/tracking
+TRACKING_GENERATOR   := $(TRACKING_DIR)/opengate-csv-generator.py
+TRACKING_CSVS        := $(TRACKING_DIR)/opengate-stories.csv \
+                        $(TRACKING_DIR)/opengate-epics.csv
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -97,6 +106,35 @@ generate-check: generate ## Fail if `sqlc generate` would change committed code
 		exit 1; \
 	fi
 	@echo "==> Generated code is up to date."
+
+# The tracking CSVs are parsed out of the implementation plan by a stdlib-only
+# Python script. Like the sqlc output above, the result is COMMITTED, so this
+# target only needs re-running when the plan's story or epic blocks change. CI
+# imports nothing from these files; it only verifies they match the corpus.
+.PHONY: tracking
+tracking: ## Regenerate the tracking CSVs from the implementation plan (commit the result)
+	@echo "==> Generating tracking CSVs from $(PLAN_DOC)..."
+	@python3 $(TRACKING_GENERATOR) $(PLAN_DOC) $(TRACKING_DIR)
+	@echo "==> Done. Review and commit changes under $(TRACKING_DIR)/."
+
+# Drift check: regenerate and fail if the working tree changed, proving the
+# committed CSVs match the planning corpus. Kept OUT of `make ci` on purpose —
+# `make ci` must not depend on a Python interpreter, so a missing python3 or a
+# broken generator can never break the main pipeline. Run it manually or as an
+# optional, non-blocking CI job.
+#
+# The diff is scoped to the generated files BY NAME, not to $(TRACKING_DIR).
+# Unlike the sqlc package above, that directory is not wholly generated: it also
+# holds the hand-written sprint retrospectives. A directory-wide diff would fail
+# this check on every new retrospective, which is how a check gets disabled.
+.PHONY: tracking-check
+tracking-check: tracking ## Fail if `make tracking` would change the committed CSVs
+	@if ! git diff --quiet -- $(TRACKING_CSVS); then \
+		echo "Tracking CSVs are stale. Run 'make tracking' and commit the result:"; \
+		git --no-pager diff --stat -- $(TRACKING_CSVS); \
+		exit 1; \
+	fi
+	@echo "==> Tracking CSVs are up to date."
 
 # ---------------------------------------------------------------------------
 # Build and test

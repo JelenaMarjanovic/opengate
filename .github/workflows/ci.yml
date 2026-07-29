@@ -92,3 +92,32 @@ jobs:
       # drift check itself.
       - name: Verify sqlc generated code is up to date
         run: make generate-check
+
+  # Tracking-artifact drift guard. Regenerates the story and epic CSVs from the
+  # planning corpus and fails if the committed files differ — catching the case
+  # where the plan was reconciled but `make tracking` was never re-run. The CSVs
+  # went stale through three successive reconciliations in exactly that way: the
+  # generator existed the whole time and nothing verified anyone had run it.
+  #
+  # This is a SEPARATE job from `ci` for the same reason as sqlc-drift above:
+  # `make ci` never invokes the generator, so if python3 or the script itself
+  # ever fails on a future runner image, build/lint/test is unaffected. The
+  # drift jobs run independently of `ci` and in parallel with it.
+  tracking-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The generator imports only the standard library (csv, re, sys, pathlib),
+      # so this pins an interpreter version and installs nothing else.
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+
+      # `make tracking-check` regenerates both CSVs and then git-diffs them by
+      # name. Same target a developer runs locally — no CI-vs-local drift in the
+      # drift check itself.
+      - name: Verify tracking CSVs are up to date
+        run: make tracking-check
