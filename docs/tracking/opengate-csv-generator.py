@@ -271,6 +271,15 @@ def extract_stories(plan_text):
     """
     Walk the document, find every story header, and build a list of fully
     populated story records ready for CSV emission.
+
+    Returns (stories, raw_fields) where raw_fields maps a story ID to the
+    unprocessed {label: value} dict that FIELD_RE produced for it. The raw
+    dict is returned alongside rather than folded into the story record
+    because validation needs to distinguish "the label was absent from the
+    plan" from "the label was present and its value is legitimately empty".
+    The Dependencies field is the case that forces the distinction: US-01.01
+    reads `_Dependencies:_ none`, which is present in the plan but renders as
+    an empty CSV column.
     """
     epic_positions = []
     for em in EPIC_HEADER_RE.finditer(plan_text):
@@ -279,6 +288,7 @@ def extract_stories(plan_text):
     sprint_map = parse_sprint_assignments(plan_text)
 
     stories = []
+    raw_fields = {}
     story_matches = list(STORY_HEADER_RE.finditer(plan_text))
     for i, match in enumerate(story_matches):
         story_id = match.group(1)
@@ -297,6 +307,7 @@ def extract_stories(plan_text):
         body = plan_text[body_start:body_end]
 
         fields = parse_story_body(body)
+        raw_fields[story_id] = fields
         role, want, so_that = split_format_clause(fields.get("format", ""))
 
         stories.append(
@@ -321,7 +332,103 @@ def extract_stories(plan_text):
                 "labels": f"{epic_id},{sprint_map.get(story_id, '')}",
             }
         )
-    return stories
+    return stories, raw_fields
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+# The seven labels every story block in the plan carries. Absence of any one of
+# them means the field pattern stopped matching the corpus, not that a story is
+# genuinely incomplete — the plan's own review process does not let a story
+# through without them.
+REQUIRED_STORY_FIELDS = (
+    "format",
+    "description",
+    "acceptance_criteria",
+    "story_points",
+    "dependencies",
+    "technical_notes",
+    "invest",
+)
+
+
+def validate(stories, raw_fields, epics):
+    """
+    Check the extraction for the signatures of a parser that has silently
+    stopped matching the corpus. Returns a list of human-readable problems;
+    an empty list means the extraction looks sound.
+
+    This exists because the generator's failure mode is not a crash. When the
+    plan was reformatted from `*Description:*` to `_Description:_`, the story
+    headers and the sprint table kept parsing, so the script still reported
+    "55 stories across 14 epics" and exited 0 while emitting rows whose every
+    content column was empty.
+
+    Why that has to be fatal rather than a warning: the drift guard's
+    remediation path is "run `make tracking` and commit the result". Any
+    failure mode in which regeneration produces garbage is therefore a failure
+    mode the guard actively converts into a committed defect — the check goes
+    red with a large diff, a reader concludes the corpus moved, regenerates,
+    commits the hollow output, and the check goes green. The guard would not
+    merely miss the fault; it would instruct someone to commit it. So the
+    generator must refuse to emit an artifact it can tell is wrong.
+    """
+    problems = []
+
+    # A corpus that yields nothing at all is the most basic form of the fault:
+    # a renamed heading convention, or simply the wrong file passed in.
+    if not stories:
+        problems.append("no stories parsed - the story header pattern matched nothing")
+    if not epics:
+        problems.append("no epics parsed - the epic header pattern matched nothing")
+
+    for story in stories:
+        sid = story["id"]
+        fields = raw_fields.get(sid, {})
+
+        # Field-level emptiness is the general form of the fault. The totals
+        # check below only catches it when the Story Points label is among the
+        # casualties; descriptions going empty while points still parse would
+        # slip past a totals check entirely.
+        absent = [f for f in REQUIRED_STORY_FIELDS if not fields.get(f, "").strip()]
+        if absent:
+            problems.append(f"{sid}: no value parsed for {', '.join(absent)}")
+
+        # Derived fields. These catch a Format clause that no longer matches
+        # "As ROLE, I want CAPABILITY, so that BENEFIT" even though the label
+        # itself was found, and a Story Points value carrying no digit.
+        if not story["role"] or not story["so_that"]:
+            problems.append(f"{sid}: Format clause did not split into role/want/benefit")
+        if story["story_points"] <= 0:
+            problems.append(f"{sid}: story points parsed as {story['story_points']}")
+        if not story["sprint"]:
+            problems.append(f"{sid}: no sprint assignment found in the sprint plan table")
+        if story["epic_id"] == "?":
+            problems.append(f"{sid}: could not be mapped to an epic")
+
+    for epic in epics:
+        if not epic["goal"]:
+            problems.append(f"{epic['id']}: no epic goal parsed")
+        if not epic["business_value"]:
+            problems.append(f"{epic['id']}: no business value parsed")
+        if epic["total_story_points"] <= 0:
+            problems.append(f"{epic['id']}: epic total parsed as 0")
+
+    # Cross-check the two independent readings of the same number: the sum of
+    # the per-story estimates against the sum of the totals each epic section
+    # states in prose. They are written by hand in different places, so an
+    # agreement is meaningful evidence that both parsed correctly.
+    story_total = sum(s["story_points"] for s in stories)
+    epic_total = sum(e["total_story_points"] for e in epics)
+    if story_total != epic_total:
+        problems.append(
+            f"story points sum to {story_total} but the epic totals sum to "
+            f"{epic_total}; the two readings of the same number disagree"
+        )
+
+    return problems
 
 
 def write_stories_csv(stories, path):
@@ -387,29 +494,37 @@ def main():
 
     plan_text = plan_path.read_text(encoding="utf-8")
 
-    stories = extract_stories(plan_text)
+    stories, raw_fields = extract_stories(plan_text)
     epics = parse_epics(plan_text)
+
+    # Validate BEFORE writing anything. Order matters: these CSVs are committed
+    # and regenerated in place, so validating after the write would leave the
+    # corrupt artifact on disk for someone to commit — which is exactly the
+    # outcome the check exists to prevent. On failure the previously committed
+    # files are left untouched and the caller sees a non-zero exit.
+    problems = validate(stories, raw_fields, epics)
+    if problems:
+        print(
+            f"ERROR: refusing to write CSVs; the extraction from {plan_path} "
+            f"looks wrong ({len(problems)} problems).",
+            file=sys.stderr,
+        )
+        print(
+            "This usually means the plan's formatting changed and a pattern in "
+            "this script no longer matches it. Fix the parser rather than "
+            "committing the output.",
+            file=sys.stderr,
+        )
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        sys.exit(1)
 
     write_stories_csv(stories, output_dir / "opengate-stories.csv")
     write_epics_csv(epics, output_dir / "opengate-epics.csv")
 
-    # Sanity check output: each story has a sprint and an epic, totals match.
-    missing_sprints = [s["id"] for s in stories if not s["sprint"]]
-    missing_epics = [s["id"] for s in stories if s["epic_id"] == "?"]
     total_points = sum(s["story_points"] for s in stories)
-    epic_points_sum = sum(e["total_story_points"] for e in epics)
-
     print(f"Parsed {len(stories)} stories across {len(epics)} epics.")
-    print(f"Total story points (stories): {total_points}")
-    print(f"Total story points (epic totals): {epic_points_sum}")
-    if missing_sprints:
-        print(f"WARNING: {len(missing_sprints)} stories without sprint assignment:")
-        for sid in missing_sprints:
-            print(f"  - {sid}")
-    if missing_epics:
-        print(f"WARNING: {len(missing_epics)} stories without epic mapping:")
-        for sid in missing_epics:
-            print(f"  - {sid}")
+    print(f"Total story points: {total_points} (matches the sum of epic totals).")
 
 
 if __name__ == "__main__":

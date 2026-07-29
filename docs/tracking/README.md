@@ -40,6 +40,19 @@ make tracking
 This reruns `opengate-csv-generator.py` over the implementation plan and
 rewrites both CSVs in place. Commit the result.
 
+The generator validates its extraction **before** writing and exits non-zero
+without touching the CSVs if the result looks wrong — any required story field
+that parsed empty, a Format clause that no longer splits, a story with zero
+points, an unmapped sprint or epic, or a disagreement between the sum of the
+story estimates and the sum of the epic totals.
+
+If that fires, **fix the parser — do not commit the output.** It means the plan's
+formatting moved and a pattern in the script no longer matches it. The check
+exists because the guard's remediation path is "regenerate and commit": without
+it, a parser that silently stops matching produces a large diff, and following
+the instructions the guard prints would commit the hollow result and turn the
+check green again.
+
 `make tracking-check` regenerates and then fails if the committed CSVs differ,
 proving they still match the corpus. It runs in CI as the `tracking-drift` job,
 separate from `make ci` so a Python failure cannot break build/lint/test.
