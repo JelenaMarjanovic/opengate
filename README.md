@@ -2,7 +2,7 @@
 
 Multi-tenant access control for fitness venues. Event-sourced Go service on Postgres, self-hostable, shipped as one binary with four operational modes.
 
-**Status: platform substrate complete, domain features not started.** The first three epics are done — 17 of 54 live user stories. Authentication, tenant isolation, the event store, the projection framework, the job queue and command idempotency work end to end. Members, credentials, doors, access policies, the access-decision path and the admin dashboard are specified but not built. Last substantive work: July 2026. See [Status](#status).
+**Status: platform substrate complete, domain features not started.** E1 and E3 are done and E2 is one story short — 17 of 55 live user stories. The outstanding E2 story is the retention job for the `sessions` table; an epic whose data grows without bound is not complete. Authentication, tenant isolation, the event store, the projection framework, the job queue and command idempotency work end to end. Members, credentials, doors, access policies, the access-decision path and the admin dashboard are specified but not built. Last substantive work: July 2026. See [Status](#status).
 
 ---
 
@@ -25,18 +25,18 @@ Full framing, including what was deliberately left out: [`docs/planning/opengate
 | Epic | Scope | Done |
 |---|---|---|
 | E1 | Project bootstrap, tooling, compose stack, CI | 6/6 |
-| E2 | Tenants, users, sessions, authn, Casbin authz, RLS | 5/5 |
+| E2 | Tenants, users, sessions, authn, Casbin authz, RLS | 5/6 |
 | E3 | Event store, projections, River queue, advisory locks, idempotency | 6/6 |
 | E4 | Member and credential aggregates | 0/4 |
 | E5–E14 | Policies, doors, access decision, SSE push, offline reconciliation, audit queries, webhooks, export, simulator, dashboard | 0/33 |
 
-Counts come from [the implementation plan](docs/planning/opengate-implementation-plan-v1.md), which is the source of truth for scope. It carries 55 story headers but 54 live stories: US-02.06 was absorbed into US-02.05 in the v1.1 reconciliation — connection-level tenant binding and the RLS policies it drives are one jointly-verifiable capability — and its header is retained only for traceability. `docs/tracking/opengate-stories.csv` predates that reconciliation and is stale.
+Counts come from [the implementation plan](docs/planning/opengate-implementation-plan-v1.md), which is the source of truth for scope. It carries 56 story headers but 55 live stories, and the difference is one header, not one story: US-02.06 was absorbed into US-02.05 in the v1.1 reconciliation — connection-level tenant binding and the RLS policies it drives are one jointly-verifiable capability — and its header is retained only for traceability, so 56 headers less that one stub is 55 live. US-02.07 is the newest of the 55, added in the v1.4 reconciliation to carry the `cleanup.sessions` retention job that v1.1 deferred out of US-02.03 without naming a destination. 55 live less the 17 done leaves 38 remaining. `docs/tracking/opengate-stories.csv` predates both reconciliations and is stale.
 
 ### Why it stopped here
 
 The epic order was infrastructure-first by design, not by accident — E1 through E3 build the substrate that every later epic depends on, and the implementation plan says so in the business-value field of each epic, written before any code existed. Members, doors and policies are CRUD over that substrate; they exercise no pattern the event store and projection framework do not already demonstrate.
 
-So the work stopped at the point where the remaining epics stopped teaching the reader anything new, and the author's time went elsewhere. That is a resourcing decision, not an architectural one. The remaining 37 stories have written acceptance criteria and no known blockers.
+So the work stopped at the point where the remaining epics stopped teaching the reader anything new, and the author's time went elsewhere. That is a resourcing decision, not an architectural one. The remaining 38 stories have written acceptance criteria and no known blockers.
 
 ### What runs today
 
