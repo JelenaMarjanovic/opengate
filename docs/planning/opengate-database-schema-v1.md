@@ -1,6 +1,6 @@
 # OpenGate — Database Schema Document
 
-**Version:** 1.3
+**Version:** 1.4
 **Status:** Draft for review
 **Document type:** Concrete schema specification (tables, columns, constraints, indexes, RLS policies, migration structure)
 **Author:** Jelena Marjanović

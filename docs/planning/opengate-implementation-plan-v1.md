@@ -1,6 +1,6 @@
 # OpenGate — Implementation Plan
 
-**Version:** 1.2
+**Version:** 1.4
 **Status:** Draft for review
 **Document type:** Implementation plan (epics, user stories, sprint plan, risk register)
 **Author:** Jelena Marjanović

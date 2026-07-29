@@ -1,6 +1,6 @@
 # OpenGate — System Design Document
 
-**Version:** 1.2
+**Version:** 1.4
 **Status:** Draft for review
 **Document type:** System design (implementation-level patterns, code-level contracts, algorithmic decisions)
 **Author:** Jelena Marjanović
