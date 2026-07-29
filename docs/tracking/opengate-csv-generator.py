@@ -35,14 +35,34 @@ EPIC_HEADER_RE = re.compile(
     r"^## \d+\. Epic (E\d+): (.+?)$", re.MULTILINE
 )
 
+# The labels that introduce each field inside a story body. Kept as a single
+# constant because the field pattern needs them twice: once to match a field,
+# and once in the lookahead that decides where that field's value ends.
+FIELD_LABELS = (
+    "Format|Description|Acceptance Criteria|Story Points|Dependencies|"
+    "Technical Notes|INVEST"
+)
+
 # Matches each labeled field within a story body. The pattern uses a lookahead
 # to stop at the next labeled field or at the trailing horizontal rule. This
 # is the key to robust extraction because story field contents can be multi-
 # paragraph (especially Description and Acceptance Criteria).
+#
+# The emphasis delimiter is captured rather than hard-coded: the plan writes
+# fields as `_Description:_`, but earlier revisions used `*Description:*`, and
+# both are valid Markdown emphasis. The `(?P=em)` backreference requires the
+# closing delimiter to match the opening one, so a stray `_Description:*` is
+# not accepted. Hard-coding one form is what silently emptied every content
+# column when the corpus was reformatted: the story headers use `**` and kept
+# parsing, so the generator still exited 0 while producing hollow rows.
+#
+# The lookahead names the labels explicitly instead of accepting any emphasized
+# capital letter. Field values contain emphasized prose of their own, and a
+# looser lookahead would truncate a Description at its first italicized word.
 FIELD_RE = re.compile(
-    r"\*(Format|Description|Acceptance Criteria|Story Points|Dependencies|Technical Notes|INVEST):\*"
-    r"\s*(.+?)"
-    r"(?=\n\n\*[A-Z]|\n\n---|\n\*\*US-)",
+    r"(?P<em>[*_])(?P<label>" + FIELD_LABELS + r"):(?P=em)"
+    r"\s*(?P<value>.+?)"
+    r"(?=\n\n[*_](?:" + FIELD_LABELS + r"):|\n\n---|\n\*\*US-|\Z)",
     re.DOTALL,
 )
 
@@ -93,10 +113,10 @@ def parse_story_body(body_text):
     """
     fields = {}
     for match in FIELD_RE.finditer(body_text):
-        label = match.group(1).lower().replace(" ", "_")
+        label = match.group("label").lower().replace(" ", "_")
         # Acceptance Criteria becomes acceptance_criteria; others are
         # single-word labels and unchanged by the replace.
-        value = match.group(2).strip()
+        value = match.group("value").strip()
         fields[label] = value
     return fields
 
