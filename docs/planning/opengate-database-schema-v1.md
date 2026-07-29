@@ -507,8 +507,9 @@ The three idempotency cache tables correspond to the three idempotency variants 
 CREATE TABLE command_idempotency_keys (
     tenant_id           uuid NOT NULL,
     idempotency_key     text NOT NULL,
-    request_hash        bytea NOT NULL,    -- SHA-256 of request body
+    request_hash        bytea NOT NULL,    -- SHA-256 of actor id || request body
     response_status     int NOT NULL,
+    response_headers    jsonb NOT NULL DEFAULT '{}'::jsonb,
     response_body       bytea NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
 
@@ -520,11 +521,11 @@ CREATE INDEX command_idempotency_keys_created_at_idx
 -- +goose StatementEnd
 ```
 
-The primary key on `(tenant_id, idempotency_key)` is both the uniqueness constraint and the lookup index for the middleware's check-then-insert pattern. The lookup query is `SELECT response_status, response_body, request_hash FROM command_idempotency_keys WHERE tenant_id = $1 AND idempotency_key = $2`, which uses the primary key directly with no further index needed.
+The primary key on `(tenant_id, idempotency_key)` is both the uniqueness constraint and the lookup index for the middleware's check-then-insert pattern. The lookup query is `SELECT response_status, response_headers, response_body, request_hash FROM command_idempotency_keys WHERE tenant_id = $1 AND idempotency_key = $2`, which uses the primary key directly with no further index needed.
 
 The index on `created_at` supports the cleanup job's deletion query, which removes rows older than the ten-minute retention window. The cleanup runs every five minutes and uses `DELETE FROM command_idempotency_keys WHERE created_at < now() - interval '10 minutes'`, which the index makes efficient.
 
-The `request_hash` column stores the SHA-256 of the request body, allowing the middleware to detect the case where a client reuses the same idempotency key with a different payload. The detection is opportunistic: most clients do not make this mistake, but when they do, returning the cached response would be incorrect because the responses semantically differ. The middleware returns 409 Conflict in this case.
+The `request_hash` column stores the SHA-256 of the authenticated actor identifier followed by the request body. The fingerprint lets the middleware detect the case where a client reuses the same idempotency key with a different payload; the detection is opportunistic, since most clients do not make this mistake, but when they do, returning the cached response would be incorrect because the responses semantically differ. Folding the actor identifier in closes a second case: because the cache key is `(tenant_id, idempotency_key)` and carries no actor scoping, a caller who obtained another caller's key inside the same tenant could otherwise replay it and be served that caller's response. With the actor in the fingerprint the two hashes cannot match, so the replay is refused. The middleware returns 409 Conflict in both cases.
 
 ### 7.2 The `decision_idempotency_keys` table
 
@@ -1158,7 +1159,7 @@ The full list of indexes specified across all tables in this document is enumera
 
 The retention policy bounds the storage growth of three categories of data: idempotency cache entries, expired sessions, and dead-lettered subscription deliveries. The retention itself is enforced by River cleanup jobs that run on a five-minute schedule, as established in System Design section six. This section specifies the exact DELETE statements and the timing parameters that the cleanup jobs use.
 
-For command and decision idempotency keys, the cleanup job issues `DELETE FROM command_idempotency_keys WHERE created_at < now() - interval '10 minutes'` and the analogous statement for decision keys. The query uses the `created_at` index for efficient pruning. Reconciliation idempotency keys are not pruned because their retention is the full event store retention.
+For command and decision idempotency keys, the cleanup job issues `DELETE FROM command_idempotency_keys WHERE created_at < now() - interval '10 minutes'` and the analogous statement for decision keys. The query uses the `created_at` index for efficient pruning. Reconciliation idempotency keys are not pruned because their retention is the full event store retention. The job's role requires more than DELETE. Postgres requires SELECT privilege on any column a statement reads to evaluate its qualifier, and this DELETE reads `created_at`, so the role holds a column-scoped `SELECT (created_at)` on both purged tables. The scoping is deliberate: a table-wide SELECT would let the cleanup read cached response bodies, which it has no reason to see. This requirement is invisible to a catalog probe of table-level privileges and is verified by executing the statement while connected as the role.
 
 For sessions, the cleanup job issues `DELETE FROM sessions WHERE expires_at < now()`. The query uses the `expires_at` index. The cleanup runs every fifteen minutes; an expired session that remains in the table for up to fifteen minutes before deletion is harmless because the session middleware checks the `expires_at` column on every lookup and treats an expired session as invalid regardless of whether the cleanup has run.
 
