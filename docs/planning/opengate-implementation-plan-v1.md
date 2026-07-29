@@ -353,7 +353,7 @@ _INVEST:_ All criteria satisfied.
 
 ---
 
-**US-02.03: Implement session creation, validation, and cleanup**
+**US-02.03: Implement session creation and validation**
 
 _Format:_ As an administrator, I want to log in to the dashboard and have my session validated on subsequent requests, so that I do not have to re-authenticate on every action and so that my session expires after inactivity for security.
 
@@ -372,7 +372,7 @@ _Dependencies:_ US-02.01, US-02.02
 
 _Technical Notes:_ Session token generation, hashing, and cookie attributes are specified in System Design section nine. The session middleware is part of the chi middleware stack.
 
-Scope (v1.1): US-02.03 delivers the `sessions` table, the login/logout/refresh use case, and the session middleware only; the connection pool and RLS policies are US-02.05. The two pre-authentication identity lookups — user-by-email at login, and session-by-token on every request — execute on the BYPASSRLS pool, because they must resolve identity across a not-yet-known tenant boundary and because US-02.05 forces RLS on `users` and `sessions` (a context-less query against an RLS-forced table returns zero rows, so a naive lookup would pass in this sprint and then break when US-02.05 lands). Open decision, deferred to this story's articulation: how login resolves the tenant, given that `users.email` is unique per tenant (`UNIQUE (tenant_id, email)`) and the `/api/v1/auth/login` endpoint carries no tenant in its path. Candidate mechanisms: tenant identifier in the request body, host/subdomain resolution, single-tenant-per-deployment, or globally-unique email. The chosen mechanism is recorded in System Design section nine.
+Scope (v1.1): US-02.03 delivers the `sessions` table, the login/logout/refresh use case, and the session middleware only; the connection pool and RLS policies are US-02.05. The two pre-authentication identity lookups — user-by-email at login, and session-by-token on every request — execute on the BYPASSRLS pool, because they must resolve identity across a not-yet-known tenant boundary and because US-02.05 forces RLS on `users` and `sessions` (a context-less query against an RLS-forced table returns zero rows, so a naive lookup would pass in this sprint and then break when US-02.05 lands). Open decision, deferred to this story's articulation: how login resolves the tenant, given that `users.email` is unique per tenant (`UNIQUE (tenant_id, email)`) and the `/api/v1/auth/login` endpoint carries no tenant in its path. Candidate mechanisms: tenant identifier in the request body, host/subdomain resolution, single-tenant-per-deployment, or globally-unique email. The chosen mechanism is recorded in System Design section nine. Session cleanup is not part of this story; the `cleanup.sessions` retention job is US-02.07.
 
 Realized (v1.2): US-02.03 as executed also delivered the regular RLS-bound pool and its tenant-binding hooks (`internal/adapters/outbound/postgres/pool.go`, `NewPool`), which the scope note above placed in US-02.05 — the authenticated session path needs that pool, so it landed here, alongside the pre-existing bypass pool. US-02.05 consequently reduced to the RLS migration and the dual-layer verification test.
 
@@ -432,7 +432,31 @@ _INVEST:_ All criteria satisfied. The story is larger (5 points) than the INVEST
 
 The connection-level tenant binding (formerly US-02.05) and the RLS policies it drives (formerly this story) are one jointly-verifiable capability and are now a single story; see US-02.05, whose acceptance criteria subsume the policy-presence, isolation, and rollback checks formerly listed here. The 2-point estimate is folded into US-02.05's 5. Retained as a stub for traceability.
 
-**Epic E2 total: 20 story points.**
+---
+
+**US-02.07: Implement the `cleanup.sessions` retention job**
+
+_Format:_ As the implementer, I want expired sessions purged on a schedule, so that the `sessions` table does not grow without bound.
+
+_Description:_ Add the `cleanup.sessions` River periodic job on the existing maintenance queue, following the `cleanup.idempotency_keys` shape established in US-03.06: a job kind, a worker that delegates to `internal/maintenance`, a `TryWithLock` advisory lock keyed `job.cleanup_sessions` so that a tick on a multi-instance deployment is skipped rather than duplicated, and the DELETE statement and fifteen-minute interval specified in Database Schema section fifteen. The job's role needs DELETE plus the column-scoped SELECT that its qualifier reads, verified by executing the statement while connected as the role rather than by probing the catalog.
+
+_Acceptance Criteria:_
+
+1. Given a session whose `expires_at` is in the past, When the cleanup job runs, Then the row is deleted.
+2. Given a session that has not expired, When the cleanup job runs, Then the row is retained.
+3. Given the job's advisory lock is held by another transaction, When a tick fires, Then the tick is skipped without error and deletes nothing.
+
+_Story Points:_ 2
+
+_Dependencies:_ US-02.03, US-03.04, US-03.06
+
+_Technical Notes:_ The DELETE statement and the interval are in Database Schema section fifteen; the job kind is in System Design section six; the job shape, the maintenance queue, and the lock convention were established by `cleanup.idempotency_keys` in US-03.06. This is the second instance of the maintenance-queue retention pattern; proving the pattern generalizes on a two-line DELETE, before E10 and E11 add further jobs to it, is part of the reason it is scheduled early rather than bundled later.
+
+_INVEST:_ All criteria satisfied.
+
+---
+
+**Epic E2 total: 22 story points.**
 
 ---
 
@@ -580,6 +604,8 @@ _Story Points:_ 5
 _Dependencies:_ US-03.05
 
 _Technical Notes:_ The three idempotency variants are specified in System Design section four. The cleanup job kind is `cleanup.idempotency_keys`.
+
+Realized (v1.4): US-03.06 as executed also delivered the `response_headers` column on `command_idempotency_keys` (Database Schema §7.1), the actor-scoped request fingerprint — SHA-256 over the authenticated actor identifier followed by the request body, which turns a cross-actor key replay inside one tenant into a 409 rather than a disclosure — the 2xx-only caching rule with its non-2xx re-lookup, so that a handler which lost an optimistic-concurrency race to its own duplicate returns the duplicate's stored success rather than its own error, the router tripwire covering both this story's and US-02.04's open mounting contracts, and the column-scoped `SELECT (created_at)` grant the cleanup job's DELETE qualifier requires. The decision-idempotency mechanism was confirmed to be the E4 in-transaction path — the record is written inside the AccessDecision use case's transaction alongside the access-attempted event append — rather than an HTTP middleware, resolving the System Design §4-versus-§16 contradiction in favor of §16.
 
 _INVEST:_ All criteria satisfied.
 
@@ -1097,7 +1123,7 @@ _INVEST:_ All criteria satisfied.
 
 _Format:_ As an auditor, I want to export audit query results to CSV, so that I can include them in compliance reports outside the OpenGate dashboard.
 
-_Description:_ Implement POST `/api/v1/tenants/{t}/audit/export` that accepts the same filters as the search query and enqueues a `cleanup.audit_csv_export` River job. The job streams results to a CSV file in the shared download volume and updates `export_status_view` with the file path.
+_Description:_ Implement POST `/api/v1/tenants/{t}/audit/export` that accepts the same filters as the search query and enqueues an `export.audit_csv` River job. The job streams results to a CSV file in the shared download volume and updates `export_status_view` with the file path.
 
 _Acceptance Criteria:_
 
@@ -1181,19 +1207,20 @@ _INVEST:_ All criteria satisfied.
 
 _Format:_ As a tenant administrator, I want to inspect failed webhook deliveries in the dashboard, so that I can troubleshoot subscriber issues.
 
-_Description:_ Create the `subscription_delivery_view` table per Database Schema section 11.1 and implement the projector that consumes `subscription.delivery.attempted` events. Implement the dashboard endpoint that lists dead-lettered deliveries with their last-error details.
+_Description:_ Create the `subscription_delivery_view` table per Database Schema section 11.1 and implement the projector that consumes `subscription.delivery.attempted` events. Implement the dashboard endpoint that lists dead-lettered deliveries with their last-error details. Add the `cleanup.dead_letter` River periodic job on the maintenance queue, following the shape established by `cleanup.idempotency_keys` in US-03.06, so that the dead-letter rows this story creates do not accumulate without bound; the DELETE statement and the thirty-day retention window are in Database Schema section fifteen.
 
 _Acceptance Criteria:_
 
 1. Given a delivery succeeds, When the projector runs, Then the corresponding row in subscription_delivery_view has status `succeeded`.
 2. Given a delivery exhausts its retry budget, When the worker dead-letters it, Then the projector updates the row to status `dead_lettered` and the dashboard query returns it.
 3. Given an administrator triggers a manual retry, When the retry job runs, Then a new delivery attempt is recorded and a successful retry sets the status back to `succeeded`.
+4. Given a dead-lettered delivery whose `dead_lettered_at` is more than thirty days in the past, When the `cleanup.dead_letter` job runs, Then the row is deleted, and a dead-lettered delivery inside the window is retained.
 
 _Story Points:_ 3
 
 _Dependencies:_ US-10.02
 
-_Technical Notes:_ The projector framework is from US-03.05. The dead-letter inspection view is in System Design section nineteen.
+_Technical Notes:_ The projector framework is from US-03.05. The dead-letter inspection view is in System Design section nineteen. The `cleanup.dead_letter` job kind is in System Design section six and its retention statement is in Database Schema section fifteen; it lands here rather than in a separate cleanup story, per the retention-job placement convention in System Design section six.
 
 _INVEST:_ All criteria satisfied.
 
@@ -1620,14 +1647,14 @@ The table below summarizes the sprint plan. Each row shows the sprint number, th
 | S4     | 4    | E2, E3             | US-03.01, US-03.02, US-03.03                               | 9      |
 | S5     | 5    | E3, E4             | US-03.04, US-03.05, US-03.06                               | 15     |
 | S6     | 6    | E4, E5             | US-04.01, US-04.02, US-04.03, US-04.04                     | 16     |
-| S7     | 7    | E5, E6             | US-05.01, US-05.02, US-05.03, US-05.04                     | 13     |
+| S7     | 7    | E2, E5, E6         | US-02.07, US-05.01, US-05.02, US-05.03, US-05.04           | 15     |
 | S8     | 8    | E6, E7             | US-06.01, US-06.02, US-06.03, US-06.04                     | 13     |
 | S9     | 9    | E7, E8             | US-07.01, US-07.02, US-07.03, US-08.01                     | 16     |
 | S10    | 10   | E9, E10            | US-09.01, US-09.02, US-09.03, US-10.01                     | 16     |
 | S11    | 11   | E10, E11, E12, E13 | US-10.02, US-10.03, US-11.01, US-11.02, US-12.01, US-13.01 | 22     |
 | S12    | 12   | E12, E13, E14      | US-12.02, US-13.02 — US-13.07, US-14.01 — US-14.04         | 44     |
 
-The total points in the plan is 201, verified two ways that agree: the sum of the 55 per-story estimates is 201, and the sum of the 14 epic totals is 201. This exceeds the sprint capacity of 108 (twelve sprints at nine points) — a genuine over-allocation of 93 points, not an artifact of double-counting, since each story appears exactly once. The over-allocation is absorbed by the planned E13 dashboard scope reduction (risk R-02): the dashboard pages carry substantial total work concentrated in the final sprints, and several E13 page-stories are expected to slip beyond the sixty-day window and become known scope-reduction items, as documented in the risk register in section twenty-three.
+The total points in the plan is 203, verified two ways that agree: the sum of the 55 per-story estimates is 203, and the sum of the 14 epic totals is 203. This exceeds the sprint capacity of 108 (twelve sprints at nine points) — a genuine over-allocation of 95 points, not an artifact of double-counting, since each story appears exactly once. The over-allocation is absorbed by the planned E13 dashboard scope reduction (risk R-02): the dashboard pages carry substantial total work concentrated in the final sprints, and several E13 page-stories are expected to slip beyond the sixty-day window and become known scope-reduction items, as documented in the risk register in section twenty-three.
 
 The dependency chain is verified by inspecting the dependencies field of each story and confirming that every story's dependencies are completed in or before its assigned sprint. The verification was performed manually during plan construction and is documented as a deferred task to be re-verified after each sprint review.
 
@@ -1676,6 +1703,7 @@ The matrix below shows the inter-story dependencies in tabular form. Each row li
 | US-02.03 | US-02.01, US-02.02           |
 | US-02.04 | US-02.03                     |
 | US-02.05 | US-02.01, US-02.03, US-01.04 |
+| US-02.07 | US-02.03, US-03.04, US-03.06 |
 | US-03.01 | US-02.05                     |
 | US-03.02 | US-01.01                     |
 | US-03.03 | US-03.01, US-03.02           |
